@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import gc
 import io
+from importlib.metadata import version
 import json
 import mmap
 import os
@@ -31,8 +32,23 @@ except ImportError:
     np = None
 try:
     from werkzeug.local import LocalProxy
+    WERKZEUG_MODERN = tuple(int(x) for x in version("werkzeug").split(".")[:2]) >= (2, 2)
 except ImportError:
     LocalProxy = None
+    WERKZEUG_MODERN = False
+
+
+def context_proxy(variable):
+    # Direct ContextVar/LocalStack constructors were added in Werkzeug 2.2.
+    # Exercise the documented callable backend on 2.0, not an invalid proxy.
+    if WERKZEUG_MODERN:
+        return LocalProxy(variable)
+    def lookup():
+        try:
+            return variable.get()
+        except LookupError:
+            raise RuntimeError("unbound ContextVar") from None
+    return LocalProxy(lookup)
 
 
 class Proxy:
@@ -312,7 +328,7 @@ class ProxyTests(Base):
     def test_real_werkzeug_bound_none_shared_and_unbound(self):
         from contextvars import ContextVar
         value = ContextVar("test_value")
-        a, b = LocalProxy(value), LocalProxy(value)
+        a, b = context_proxy(value), context_proxy(value)
         r = self.scan([("a", a), ("b", b)])
         self.assertEqual(len(r["proxies"]), 2)
         token = value.set(bytearray(1000))
@@ -942,12 +958,20 @@ memwatch.uninstall()
         data = bytearray(1000)
         local.value = data
         stack.push(data)
-        a, b, c = LocalProxy(local, "value"), LocalProxy(stack), LocalProxy(lambda: local.value)
+        a, b, c = LocalProxy(local, "value"), (LocalProxy(stack) if WERKZEUG_MODERN else stack()), LocalProxy(lambda: local.value)
         result = self.scan([("a", a), ("b", b), ("c", c)])
         self.assertEqual(result["proxies"][0]["proxy_count"], 3)
         self.assertEqual(result["proxy_totals"]["targets_union_bytes"], sys.getsizeof(data))
         stack.pop()
         del local.value
+        # The repository demo must also use a construction valid in both series.
+        import b as demo_backend
+        demo_backend.install(data)
+        try:
+            for proxy in (demo_backend.payload_proxy, demo_backend.stack_proxy, demo_backend.lazy_proxy):
+                self.assertIs(object.__getattribute__(proxy, "_get_current_object")(), data)
+        finally:
+            demo_backend.uninstall()
 
     def test_closed_mmap_and_released_memoryview_are_explicit(self):
         mm = mmap.mmap(-1, 4096)

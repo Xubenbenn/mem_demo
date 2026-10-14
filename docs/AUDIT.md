@@ -29,7 +29,7 @@
 
 **输出与配置。** 单次 output/enabled/sink 配置过去未完全生效；写文件错误静默；最新报告依赖文件名字典序；node delta 在 sink 之后补写。新版使用有效单次配置、输出错误字段、原子单文件写入、session 防同 PID 文件冲突、timestamp/seq/pid 查询，node delta 在 sink/落盘之前生成。label_prefix 清洗防止路径越界。JSON+TXT 每个文件原子更新，但两文件不是事务。
 
-**系统与接入。** RSS 降级单位和 USS API 修正；resource 值标记历史峰值。CLI 与提前加载的 memwatch 共用状态，shutdown 时保留目标 __main__ 全局。sitecustomize 改为显式/环境选择加入，保留首个其他启动钩子，禁用监控不禁用应用钩子。原 b.py 的 LocalStack 代理用法由 LocalProxy(stack, 'top') 改为 LocalProxy(stack)。
+**系统与接入。** RSS 降级单位和 USS API 修正；resource 值标记历史峰值。CLI 与提前加载的 memwatch 共用状态，shutdown 时保留目标 __main__ 全局。sitecustomize 改为显式/环境选择加入，保留首个其他启动钩子，禁用监控不禁用应用钩子。原 b.py 的 LocalProxy(stack, 'top') 在不同版本语义不同，改用跨版本公共工厂 stack()。
 
 ## 4. 验证证据与可复现命令
 
@@ -69,3 +69,9 @@ CI 工作流安装真实可选依赖，覆盖 Python 3.9（Werkzeug 2.0.3）、3
 - psutil 进程内存信息：https://psutil.readthedocs.io/en/latest/#psutil.Process.memory_full_info
 
 报告中的设计选择和测试结论来自本仓库代码/实际运行；上述资料用于界定 API 能力，不能替代本项目验收证据。
+
+## 7. 首轮 CI 发现的兼容性差异
+
+提交 `4a461a306aeb83f8f19e5e4094cd5a839b53a256`，Actions run `38506380554`：Python 3.11 / 3.13 job 成功；Python 3.9 + Werkzeug 2.0.3 的两个真实代理测试失败。核对上游 `pallets/werkzeug` tag `2.0.3` 的 src/werkzeug/local.py 后确认：直接传 ContextVar、直接传 LocalStack 的构造契约与 2.2+ 不同。
+
+处理：不修改计量引擎去猜测无效 proxy 的意图；测试在 2.0 上采用受支持的 callable / stack() 工厂，在 2.2+ 保留直接后端测试。b.py 使用跨版本公共 stack() 工厂，并加入同一真实后端测试中断言三个代理指向同一业务对象。没有删掉失败断言或将它们跳过；最终状态以修复提交的 CI 为准。

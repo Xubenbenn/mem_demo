@@ -5,7 +5,7 @@ _locals = Local()
 _stack = LocalStack()
 
 payload_proxy = LocalProxy(_locals, "payload")
-stack_proxy = LocalProxy(_stack)  # LocalStack 后端直接代理栈顶，不查 payload.top
+stack_proxy = _stack()  # 公共工厂同时兼容 Werkzeug 2.0 与 2.2+ 的栈顶代理
 lazy_proxy = LocalProxy(lambda: _locals.payload)
 
 
