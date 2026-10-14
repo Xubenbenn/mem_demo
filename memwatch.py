@@ -133,7 +133,7 @@ def _phase_sites(cfg, label=None, captured=None, deadline=None):
     return out
 
 
-def _normalise_cfg(base, overrides=None):
+def _normalise_cfg(base, overrides=None, refresh_roots=True):
     cfg = dict(base)
     overrides = overrides or {}
     unknown = [k for k in overrides if k not in DEFAULT]
@@ -181,7 +181,9 @@ def _normalise_cfg(base, overrides=None):
     auto = cfg.get("_root_paths_auto", False)
     if "root_paths" in overrides:
         auto = overrides["root_paths"] is None
-    if cfg["root_paths"] is None or auto:
+    if cfg["root_paths"] is None or (auto and (refresh_roots or "root_paths" in overrides)):
+        # Import/path discovery is configuration work, not a per-checkpoint scan.
+        # install() or an explicit root_paths=None refreshes inferred directories.
         cfg["root_paths"], auto = _auto_root_paths(), True
     elif isinstance(cfg["root_paths"], (str, os.PathLike)):
         cfg["root_paths"] = [cfg["root_paths"]]
@@ -209,6 +211,7 @@ def _snapshot_impl(label, profile=None, explicit=None, frame=None, effective=Non
     rep = {"schema_version": 2, "producer": "memwatch", "version": __version__,
            "seq": _STATE["seq"], "label": label, "profile": profile,
            "pid": os.getpid(), "ts": time.time(), "session": _STATE.get("session", ""),
+           "forked_from_pid": _STATE.get("forked_from_pid"),
            "config": {k: cfg[k] for k in DEFAULT if k != "sink"},
            "errors": [], "warnings": warnings + list(_STATE["warnings"]), "phases": {},
            "callsite": _frame_label(frame), "roots_scope": cfg["roots_scope"],
@@ -250,6 +253,10 @@ def _snapshot_impl(label, profile=None, explicit=None, frame=None, effective=Non
             rep["sites"] = phase("sites", lambda: _phase_sites(cfg, label), {"status": "error", "rows": []})
         else:
             rep["sites"] = {"status": "skipped", "reason": "max_seconds_before_snapshot", "rows": []}
+    if captured is not None:
+        rep["sites"] = phase("sites", lambda: _phase_sites(cfg, label, captured, budget.deadline),
+                             {"status": "error", "reason": "statistics_failed", "rows": []})
+        captured = None
     pool = None
     if (profile == "deep" or cfg["count_objects"]) and budget.alive():
         pool = phase("gc_objects", gc.get_objects)
@@ -284,7 +291,7 @@ def _snapshot_impl(label, profile=None, explicit=None, frame=None, effective=Non
             if not rep["holders"]:
                 rep["diagnostics"] = ["没有可归因的变量；检查 root_paths / scope / budget，或使用 track()", str(rep["root_diagnostics"])]
             if rep["holders_truncated"]:
-                rep["warnings"].append("对象图或归因被预算截断；bytes 是已观察下界，exclusive_bytes 不可用")
+                rep["warnings"].append("对象图/归因不完整（预算、读取错误或上下文缺失）；bytes 仅为已观察估计，exclusive_bytes 不可用")
             if any(p["state"] == "context_unavailable" for p in rep["proxies"]):
                 rep["warnings"].append("其他线程/挂起任务的 LocalProxy 不能在当前上下文安全解引用；请在目标上下文 mark()")
             if any(p["shared"] for p in rep["proxies"]):
@@ -321,9 +328,6 @@ def _snapshot_impl(label, profile=None, explicit=None, frame=None, effective=Non
             if profile == "deep":
                 rep.update(census=[], census_meta={"complete_for_scope": False, "truncated": True, "reasons": ["graph_phase_error"]})
         del roots, pool
-    if captured is not None:
-        rep["sites"] = phase("sites", lambda: _phase_sites(cfg, label, captured, budget.deadline),
-                             {"status": "error", "reason": "statistics_failed", "rows": []})
     rep["tracing"] = {"active": tracemalloc.is_tracing(), "owned": _STATE["tracemalloc_owned"],
                       "before_target_imports": _STATE["tracemalloc_early"],
                       "history": "no allocation history before tracing started"}
@@ -378,19 +382,21 @@ def _do_snapshot(label, profile=None, explicit=None, frame=None, enrich=None, ba
     base = _STATE.get("config") or DEFAULT
     fail_silent = (explicit or {}).get("fail_silent", base.get("fail_silent", True))
     acquired = False
+    capture_lock = None
     try:
         if background_generation is not None:
             if not _STATE["installed"] or background_generation != _STATE["generation"]:
                 return {"skipped": "cancelled", "label": label}
         elif not _STATE["installed"]:
             install()
-        cfg, unknown = _normalise_cfg(_STATE["config"], explicit)
+        cfg, unknown = _normalise_cfg(_STATE["config"], explicit, refresh_roots=False)
         if not isinstance(label, str):
             raise TypeError("snapshot label must be str")
         if not cfg["enabled"]:
             return {"skipped": "disabled", "label": label}
         # Non-reentrant: a sink calling mark() must not recursively capture.
-        acquired = _STATE["lock"].acquire(blocking=False)
+        capture_lock = _STATE["lock"]
+        acquired = capture_lock.acquire(blocking=False)
         if not acquired:
             return {"skipped": "busy", "label": label}
         generation = _STATE["generation"]
@@ -442,7 +448,9 @@ def _do_snapshot(label, profile=None, explicit=None, frame=None, enrich=None, ba
         return {"label": label, "errors": ["snapshot failed: " + type(exc).__name__], "status": "error"}
     finally:
         if acquired:
-            _STATE["lock"].release()
+            # A fork inside a user callback replaces the child's global lock.
+            # Release the particular lock this invocation actually acquired.
+            capture_lock.release()
 
 
 def snapshot(label="checkpoint", profile=None, **overrides):
@@ -642,12 +650,18 @@ def report(path=None, seq=None, pid=None):
             filename = os.path.join(target, name)
             with open(filename, encoding="utf-8") as fh:
                 row = json.load(fh)
+            # A directory may contain arbitrary JSON, not only our reports.
+            if not isinstance(row, dict):
+                continue
+            timestamp = row.get("ts", 0)
+            if type(timestamp) not in (int, float) or not math.isfinite(timestamp):
+                continue
             if seq is not None and row.get("seq") != int(seq):
                 continue
             if pid is not None and row.get("pid") != int(pid):
                 continue
-            candidates.append((row.get("ts", 0), os.stat(filename).st_mtime_ns, row))
-        except (OSError, ValueError, TypeError):
+            candidates.append((timestamp, os.stat(filename).st_mtime_ns, row))
+        except (OSError, ValueError, TypeError, OverflowError):
             continue
     if not candidates:
         raise FileNotFoundError("no report matches the requested path/seq/pid")
@@ -900,6 +914,8 @@ def install(**kwargs):
         _STATE["config"], _STATE["installed"] = cfg, True
         for message in warnings + env_warnings:
             _warn(message)
+        if fresh and _STATE.get("forked_from_pid") is not None:
+            _warn("fork child: new probe session; inherited baselines cleared; native runtime fork-safety is application responsibility")
         if cfg["trace"] and cfg["enabled"] and not tracemalloc.is_tracing():
             tracemalloc.start(cfg["frames"])
             _STATE["tracemalloc_owned"] = True
@@ -940,6 +956,33 @@ def uninstall():
         _STATE["tracemalloc_owned"] = _STATE["tracemalloc_early"] = False
         flush()
         _STATE["config"] = None
+
+
+def _after_fork_child():
+    """Drop inherited probe locks/workers without acquiring any old lock.
+
+    Do not start threads or take a snapshot in an at-fork callback. The next
+    explicit install/mark starts a fresh child session using the saved config.
+    This isolates probe state; it cannot make an application's native code safe
+    to fork. Parent state is unaffected and tracked registrations are preserved.
+    """
+    parent_pid = _STATE.get("pid")
+    _STATE.update(lock=threading.Lock(), lifecycle=threading.RLock(),
+                  stop=threading.Event(), trigger=threading.Event(),
+                  workers={}, threads=[], installed=False,
+                  generation=_STATE["generation"] + 1,
+                  pid=os.getpid(), forked_from_pid=parent_pid,
+                  seq=0, label_counts={}, signal_pending=False,
+                  prev_snapshot=None, prev_label=None, growth_base=None,
+                  prev_holders={}, prev_rss=None)
+    _STATE["baseline_epoch"] = _STATE.get("baseline_epoch", 0) + 1
+    _remove_at()
+    _set_signal(False)
+
+
+if hasattr(os, "register_at_fork") and not _STATE.get("at_fork_registered"):
+    os.register_at_fork(after_in_child=_after_fork_child)
+    _STATE["at_fork_registered"] = True
 
 
 def _cli_run(argv):

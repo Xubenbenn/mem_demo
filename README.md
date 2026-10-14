@@ -2,7 +2,7 @@
 
 在指定业务节点观察：哪些变量可达大量对象、哪些类型占多少已识别内存、哪些 LocalProxy 共享目标，以及哪些分配点发生变化。
 
-**v2 部署必须同时复制 `memwatch.py` 和 `_memwatch_core.py`，或使用整个仓库。** 运行核心无强制第三方依赖。`memprobe.py` 是旧 API 的兼容入口，复用同一统计引擎。
+**v2.1 部署必须同时复制 `memwatch.py` 和 `_memwatch_core.py`，或使用整个仓库。** 运行核心无强制第三方依赖。`memprobe.py` 是旧 API 的兼容入口，复用同一统计引擎。
 
 ## 最小接入
 
@@ -63,6 +63,14 @@ PYTHONPATH=/path/to/mem_demo MEMWATCH_AUTO=1 MEMWATCH_OUT=./reports python app.p
 
 预算是协作式的。大堆图仍可能带来明显内存/延时开销，`gc.get_objects()`、扩展方法、代理 callable、tracemalloc 统计和输出无法被该预算强制打断。生产热路径使用 counters 或缩小 roots，deep 用于选定诊断节点。其他线程/任务的 ContextVar 代理不能用当前上下文伪造解析结果；在实际请求上下文内 `mark()` 更可靠。
 
+## v2.1 补强
+
+容器中的函数闭包、默认参数、函数缓存、类属性，以及 NumPy 子类的额外引用会纳入同一去重图。代理解析/大小读取失败或外部上下文缺失会明确标记不完整；不会把已观察到的少量字节伪装成完整结果。`preview=False` 也隐藏字典键路径中的值，但不隐藏变量名、文件路径、标签和类型名。
+
+自动推断的 `root_paths` 在安装时缓存；新模块仍会扫描，但若新增目录不在缓存范围内，应显式提供目录，或调用 `install(root_paths=None)` 重新推断。单次 `mark_all(root_paths=None)` 只刷新该次采集。
+
+POSIX fork 子进程会清除继承的探针锁、worker 状态和比较基线，保留配置与 track 登记；下一次显式采集创建新会话。这不保证业务扩展库本身可以安全 fork。
+
 ## 验证与资料
 
 ```bash
@@ -71,6 +79,16 @@ MEMWATCH_AUTO=0 python test_modes.py
 # 等价：MEMWATCH_AUTO=0 python -m unittest discover -s tests -v
 ```
 
-本次本地验证：CPython 3.13.5 / NumPy 2.3.5；75 tests，72 passed，3 skipped，退出码 0。跳过项是缺少 Werkzeug 的两个真实代理测试，以及被平台启动钩子遮蔽的 PYTHONPATH 注入测试；不是失败转为通过。CI 配置另覆盖 Python 3.9 / 3.11 / 3.13，结果以 GitHub Actions 实际运行记录为准。
+本次本地验证：CPython 3.13.5 / NumPy 2.3.5；104 tests，101 passed，3 skipped，退出码 0。跳过项是缺少 Werkzeug 的两个真实代理测试，以及被平台启动钩子遮蔽的 PYTHONPATH 注入测试；不是失败转为通过。CI 配置另覆盖 Python 3.9 / 3.11 / 3.13，结果以 GitHub Actions 实际运行记录为准。
 
-详细配置见 [README_INTERFACE.md](README_INTERFACE.md)，问题、设计与验证证据见 [docs/AUDIT.md](docs/AUDIT.md)。v1 原说明和顺序敏感的测试逐字保存在 `docs/legacy/`，只作历史参考，不是 v2 契约。
+新增 29 项回归测试；选取其中 10 项在原始 v2.0 上反向运行，得到 9 failures / 1 error，证明这些测试确实能暴露旧缺陷。CI 保存每个 Python 版本的测试日志、运行环境和精确被测源码。
+
+开销基准（每个样本独立进程，非业务性能保证）：
+
+```bash
+python benchmarks/checkpoint_overhead.py --objects 1000 --trials 2 --trace --output benchmark.json
+```
+
+基准同时记录调用总耗时与采集内部耗时；deep 在有追踪的大堆上仍可能耗尽 5 秒预算，应检查完整性而不是无限提高预算。
+
+详细配置见 [README_INTERFACE.md](README_INTERFACE.md)，本次缺陷复现、修复与证据见 [docs/AUDIT_V21.md](docs/AUDIT_V21.md)，此前 v2 设计保留在 [docs/AUDIT.md](docs/AUDIT.md)。v1 原说明和顺序敏感的测试逐字保存在 `docs/legacy/`，只作历史参考，不是 v2 契约。

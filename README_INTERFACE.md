@@ -1,4 +1,4 @@
-# memwatch v2 接口与统计契约
+# memwatch v2.1 接口与统计契约
 
 ## 1. 部署、兼容性
 
@@ -40,7 +40,7 @@ diagnose(frame=None, write=True)
 | include_third_party | false | 纳入库模块/帧作为根；可能显著增加开销 |
 | include_threads / include_asyncio | true / true | all 模式补充线程帧 / 当前运行事件循环的任务帧 |
 | resolve_proxies | true | 解析代理；可能执行业务 callable；不需要时关闭 |
-| skip_infra | true | 不展开 module/function/class/frame 整个内部图 |
+| skip_infra | true | 跳过基础设施图；保留函数闭包/默认参数/缓存与类数据引用，不跟随函数全局字典 |
 | max_objects / max_edges | 500000 / 2000000 | 图节点数 / 检查引用边数 |
 | max_roots / max_proxy_groups | 4096 / 1024 | 根绑定采集上限 / 代理目标组上限 |
 | max_propagations / max_root_links | 2000000 / 2000000 | 可达关系传播 / 展开到根明细的操作预算 |
@@ -60,6 +60,8 @@ diagnose(frame=None, write=True)
 
 预算值 0 是零预算；仅标签两个限额的 0 表示不限制。类型超过内部 2048 类归并到 `<other_types>`，并标记分组。引用路径最多 64 条/代理目标组，另有截断字段。
 
+自动 `root_paths` 在 install 时推断并缓存，不再于每个检查点重复扫描模块路径。已有目录内新导入的模块仍会纳入 roots；新增目录应显式配置，或 `install(root_paths=None)` 刷新。单次调用显式传 `root_paths=None` 仅刷新该次配置。
+
 单次 snapshot/mark 参数覆盖测量、输出、sink、enabled 和限额配置，不改变全局配置。`trace/frames/on_signal/at/watch_file/interval/rss_threshold_mb` 属于 install 生命周期设置；在单次调用传入并不会重装钩子或追溯历史。调用点需要配置它们时先 install。
 
 环境变量支持：`MEMWATCH_OUT`、`MEMWATCH_PROFILE`、`MEMWATCH_ALL_PROFILE`、`MEMWATCH_TOP`、`MEMWATCH_AT`、`MEMWATCH_WATCH_FILE`、`MEMWATCH_FRAMES`、`MEMWATCH_RSS_MB`、`MEMWATCH_INTERVAL`、`MEMWATCH_ROOT_PATHS`（os.pathsep 分隔）、`MEMWATCH_RESOLVE_PROXY`、`MEMWATCH_ENABLED`。显式 install 参数优先。
@@ -76,7 +78,7 @@ diagnose(frame=None, write=True)
 
 JSON `*_bytes` 为字节；界面 KiB/MiB 用 1024 进制，历史兼容 `*_mb` 实际也是 MiB。`python_bytes` 是 sizeof 口径剔除已识别 NumPy 自有数据后的部分，并不等同于 CPython 分配器账本。未知扩展对象的 C __sizeof__ 可能含自身原生分配，也可能完全不报告。
 
-NumPy 自有 ndarray 的数据可能已经包含在 __sizeof__ 中，因此拆分 nbytes 而不是再次相加。视图沿 base、memoryview 沿 exporter 找共享资源。object dtype 数组还遍历其 Python 元素。未知 capsule/外部 owner 的内存不猜测。
+NumPy 自有 ndarray 的数据可能已经包含在 __sizeof__ 中，因此拆分 nbytes 而不是再次相加。视图沿 base、memoryview 沿 exporter 找共享资源。object dtype 数组还遍历其 Python 元素；NumPy 子类自己的实例字典/slots 引用通过 GC referents 补充，并按身份去重。未知 capsule/外部 owner 的内存不猜测。
 
 mmap 使用当前映射 len 而不是整个文件 size；mapped_bytes 与 logical_bytes 不等于驻留内存，映射不加入 accounted_bytes。相同物理页的不同映射不作物理页去重。
 
@@ -86,12 +88,16 @@ tracemalloc 只覆盖开启后记录的分配；部分扩展会主动注册原�
 
 ## 6. 完整性、低入侵与限制
 
-检查 `coverage.graph.complete`、`coverage.attribution.complete`、`census_meta`、`proxy_totals.truncated`、`sites.status` 和 `errors`。预算不足保留部分行，exclusive_bytes 置 null。phase completed 不表示覆盖完整，必须同时看 coverage。
+检查 `coverage.graph.complete`、`coverage.attribution.complete`、`census_meta`、`proxy_totals.truncated`、`sites.status` 和 `errors`。预算不足、代理解析错误、大小读取错误或不可用的代理上下文都会标记相应范围不完整，保留部分行，exclusive_bytes 置 null。原因见 graph/census 的 reasons，而不只看 errors 顶层。phase completed 不表示覆盖完整，必须同时看 coverage。
 
 已识别图内的计数去重不代表大小估计绝对准确。并发变化、被跳过的基础设施、不可检查的扩展所有者都可能影响覆盖。报告不是 stop-the-world 原子堆快照，普通 mark_all 不适合无测量地部署到每请求热路径。
+
+分配点统计在图遍历前处理，避免图耗尽预算后必然丢失分配点。各阶段仍共享预算，后续 GC 普查可能被截断；不是保证 deep 每一节都完整。
+
+`preview=False` 禁用值预览及字典键路径中的值，不隐藏根标签、变量名、类型名、源文件路径。报告仍可能包含敏感元数据，应限制输出目录访问。基础类型/模块描述符绕过自定义元类属性，避免观察时执行这些属性；显式允许的 sizeof 和代理 callable 仍可执行业务代码。
 
 预算不能中断运行中的 C 方法、gc.get_objects、get_referents、代理 callable、tracemalloc statistics、文件 I/O 和 sink。`elapsed_ms` 仅采集阶段；落盘/sink 的成本另计。对象图本身可能消耗大量内存。census 可包含探针自身存活对象；分配点剔除直接落在探针源码的记录，但不是完全无观察者效应。
 
 不会自动修改业务对象或删除共享引用。自动修复的是监控记账，不是任意业务生命周期。已有 debugger/profiler 被保留；在冲突时禁用到点触发并报告。外部 tracer 启停不能被完全识别（特别是相同 frames 的重启），不应并发争夺 tracemalloc 所有权。
 
-跨进程 fork / GPU 内存 / 所有线程的历史 ContextVar 值 / 支配树 retained size 不在本次实现保证内。显式 track 是强引用；报告只有标量/容器元数据，但采集期间临时根图必然会暂时持有目标。
+POSIX `os.register_at_fork` 回调在子进程重置探针锁、worker 状态、限额与比较基线，并撤销继承的自有触发钩子；不在回调内采集或启动线程。配置与 track 登记保留，下一次 install/mark 创建独立 session，报告包含 forked_from_pid。父进程状态不变。此隔离不保证业务原生库的 fork 安全，也不覆盖绕过 Python fork 钩子的第三方启动方式。GPU 内存、所有线程的历史 ContextVar 值与支配树 retained size 仍不在保证内。显式 track 是强引用；报告只有标量/容器元数据，但采集期间临时根图必然会暂时持有目标。

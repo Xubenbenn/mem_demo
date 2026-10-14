@@ -23,7 +23,7 @@ import types
 import weakref
 from collections import deque
 
-__version__ = "2.0"
+__version__ = "2.1"
 DEFAULT = {
     "out_dir": None, "enabled": True, "profile": "standard", "all_profile": "deep",
     "top": 20, "trace": True, "frames": 5, "root_paths": None,
@@ -44,8 +44,19 @@ _OBSERVER_FILES = {_SELF_FILE, os.path.join(os.path.dirname(_SELF_FILE), "memwat
 _INFRA_TYPES = (types.ModuleType, type, types.FunctionType, types.CodeType,
                 types.FrameType, types.BuiltinFunctionType)
 _GC_HEAD = sys.getsizeof([]) - list.__sizeof__([])
+_TYPE_FIELDS = {name: type.__dict__[name] for name in
+                ("__dict__", "__mro__", "__flags__", "__module__", "__qualname__")}
+_MODULE_DICT = types.ModuleType.__dict__["__dict__"]
+
+
+def _type_field(cls, name):
+    # Even type.__getattribute__ may run a property on a custom metaclass.
+    # The base descriptor reads the interpreter field without that dispatch.
+    return _TYPE_FIELDS[name].__get__(cls)
+
+
 _STATE = {
-    "installed": False, "config": None, "seq": 0, "generation": 0,
+    "installed": False, "config": None, "seq": 0, "generation": 0, "pid": os.getpid(),
     "prev_snapshot": None, "prev_label": None, "growth_base": None,
     "tracemalloc_owned": False, "tracemalloc_early": False,
     "lock": threading.Lock(), "lifecycle": threading.RLock(),
@@ -60,8 +71,10 @@ _STATE = {
 def _typename(obj):
     t = type(obj)
     try:
-        return "%s.%s" % (type.__getattribute__(t, "__module__"),
-                          type.__getattribute__(t, "__qualname__"))
+        module, name = _type_field(t, "__module__"), _type_field(t, "__qualname__")
+        if type(module) is not str or type(name) is not str:
+            return "unknown"
+        return module + "." + name
     except Exception:
         return "unknown"
 
@@ -69,7 +82,8 @@ def _typename(obj):
 def _is_proxy(obj):
     # isinstance(obj, ...) may ask LocalProxy for its forwarded __class__.
     try:
-        return any("_get_current_object" in vars(c) for c in type(obj).__mro__)
+        return any("_get_current_object" in _type_field(c, "__dict__")
+                   for c in _type_field(type(obj), "__mro__"))
     except Exception:
         return False
 
@@ -93,7 +107,7 @@ def _proxy_state(obj):
     return _resolve_proxy_result(obj)[0] if _is_proxy(obj) else ""
 
 
-def _sizeof(obj, allow_custom=False):
+def _sizeof(obj, allow_custom=False, errors=None):
     """Shallow size, bypassing forwarded proxy and Python user __sizeof__ hooks.
 
     Built-in C size descriptors are used directly. They remain cooperative calls,
@@ -103,17 +117,21 @@ def _sizeof(obj, allow_custom=False):
         if _is_proxy(obj):
             value = object.__sizeof__(obj)
         else:
-            method = next((vars(c)["__sizeof__"] for c in type(obj).__mro__
-                           if "__sizeof__" in vars(c)), object.__sizeof__)
+            dictionaries = (_type_field(c, "__dict__")
+                            for c in _type_field(type(obj), "__mro__"))
+            method = next((d["__sizeof__"] for d in dictionaries if "__sizeof__" in d),
+                          object.__sizeof__)
             if not allow_custom and not isinstance(method, (types.MethodDescriptorType,
                                                             types.WrapperDescriptorType)):
                 method = object.__sizeof__
             value = method(obj)
         value = max(0, int(value))
-        if getattr(type(obj), "__flags__", 0) & (1 << 14):
+        if _type_field(type(obj), "__flags__") & (1 << 14):
             value += _GC_HEAD
         return value
-    except Exception:
+    except Exception as exc:
+        if errors is not None:
+            errors.append("sizeof_error:" + type(exc).__name__)
         return 0
 
 
@@ -150,16 +168,17 @@ def _is_infra(obj):
 def _numpy_type(obj):
     # Never import NumPy just to measure a process that does not use it.
     mod = sys.modules.get("numpy")
-    cls = vars(mod).get("ndarray") if issubclass(type(mod), types.ModuleType) else None
+    cls = _MODULE_DICT.__get__(mod).get("ndarray") if issubclass(type(mod), types.ModuleType) else None
     return cls if isinstance(cls, type) and issubclass(type(obj), cls) else None
 
 
 def _measure(obj, cfg):
-    own = _sizeof(obj, cfg.get("allow_custom_sizeof", False))
+    errors = []
+    own = _sizeof(obj, cfg.get("allow_custom_sizeof", False), errors)
     native = mapped = 0
     logical = None
     source = "shallow"
-    note = None
+    note = errors[0] if errors else None
     array_type = _numpy_type(obj)
     try:
         if array_type is not None:
@@ -170,7 +189,7 @@ def _measure(obj, cfg):
             if flags.owndata:
                 # ndarray.__sizeof__ already includes its own data allocation.
                 own = max(0, int(array_type.__sizeof__(obj)) - nbytes)
-                if getattr(type(obj), "__flags__", 0) & (1 << 14):
+                if _type_field(type(obj), "__flags__") & (1 << 14):
                     own += _GC_HEAD
                 native = nbytes
                 source = "numpy_owned_buffer"
@@ -217,6 +236,9 @@ def _children(obj):
                 yield from _numpy_object_elements(obj, array_type)
             else:
                 yield from array_type.flat.__get__(obj)
+        # ndarray subclasses may retain independent Python payloads in a dict or
+        # slots. NumPy's base/data descriptors alone do not expose those edges.
+        yield from gc.get_referents(obj)
         return
     if t is memoryview:
         yield obj.obj
@@ -234,6 +256,33 @@ def _numpy_object_elements(obj, array_type):
                 yield from _numpy_object_elements(field, array_type)
     else:
         yield from array_type.flat.__get__(obj)
+
+
+def _infra_payload_edges(obj):
+    """Keep application data behind functions/classes, without module globals.
+
+    Reading GC referents does not materialize a function's lazy __dict__ or
+    annotations. Never call a property/accessor to inspect its retained data.
+    """
+    if type(obj) is types.FunctionType:
+        excluded = {id(obj.__globals__), id(obj.__code__)}
+        builtins = getattr(obj, "__builtins__", None)  # Python 3.10+
+        if builtins is not None:
+            excluded.add(id(builtins))
+        else:
+            # On 3.9 the function's builtins dictionary is not exposed publicly.
+            candidate = obj.__globals__.get("__builtins__")
+            excluded.add(id(candidate))
+            if type(candidate) is types.ModuleType:
+                excluded.add(id(vars(candidate)))
+        for i, child in enumerate(gc.get_referents(obj)):
+            if id(child) not in excluded:
+                yield ".function_ref[%d]" % i, child
+    elif issubclass(type(obj), type):
+        for name, child in _type_field(obj, "__dict__").items():
+            if not name.startswith("__"):
+                yield "." + name, child
+    # Modules, frames, code and built-in callables remain terminal boundaries.
 
 
 class _Budget:
@@ -299,7 +348,7 @@ def _lib_prefixes():
 def _module_path(mod):
     if not issubclass(type(mod), types.ModuleType):
         return None
-    path = types.ModuleType.__getattribute__(mod, "__dict__").get("__file__")
+    path = _MODULE_DICT.__get__(mod).get("__file__")
     return os.path.realpath(path) if isinstance(path, str) else None
 
 
@@ -351,7 +400,7 @@ def _frame_is_first_party(frame, root_paths, include_tp, widen=False, libs=None,
 def _module_is_first_party(mod, root_paths):
     path = _module_path(mod)
     if path is None:
-        return issubclass(type(mod), types.ModuleType) and vars(mod).get("__name__") == "__main__"
+        return issubclass(type(mod), types.ModuleType) and _MODULE_DICT.__get__(mod).get("__name__") == "__main__"
     return _path_accepted(path, {"root_paths": root_paths, "include_third_party": False})
 
 
@@ -362,9 +411,14 @@ def _root_members(label, value, kind):
                             ("closure", value.__closure__)):
             if obj:
                 yield label + "." + suffix, obj, kind
+        for suffix, obj in _infra_payload_edges(value):
+            if type(obj) is dict and obj is not value.__kwdefaults__:
+                yield label + suffix, obj, kind
     elif issubclass(type(value), type):
-        for attr, obj in type.__getattribute__(value, "__dict__").items():
-            if not attr.startswith("__") and not _is_infra(obj) and not issubclass(type(obj), (property, staticmethod, classmethod)):
+        for attr, obj in _type_field(value, "__dict__").items():
+            if not attr.startswith("__") and not issubclass(type(obj), types.ModuleType):
+                # Method/property descriptors are retained objects, not invoked.
+                # Nested functions/classes expose only their data edges in scan.
                 yield label + "." + attr, obj, kind
     elif not _is_infra(value):
         yield label, value, kind
@@ -392,7 +446,7 @@ def _roots_from_modules(cfg, diag=None):
                 continue
             if not path and name != "__main__":
                 continue
-            for attr, value in types.ModuleType.__getattribute__(mod, "__dict__").items():
+            for attr, value in _MODULE_DICT.__get__(mod).items():
                 if budget and not budget.alive():
                     break
                 if attr.startswith("__"):
@@ -570,10 +624,10 @@ def _add_type(table, name, info):
     row["bytes"] += info[0] + info[1]
 
 
-def _edge_iter(obj):
+def _edge_iter(obj, preview=True):
     if type(obj) is dict:
-        for key, value in obj.items():
-            label = _safe_preview(key, 32) if type(key) in (str, int) else _typename(key)
+        for i, (key, value) in enumerate(obj.items()):
+            label = (_safe_preview(key, 32) if type(key) in (str, int) else _typename(key)) if preview else "entry#%d" % i
             yield ".key[" + label + "]", key
             yield "[" + label + "]", value
     else:
@@ -636,6 +690,8 @@ def _scan_roots(roots, cfg, deadline=None, diag=None, gc_pool=None):
         _add_type(graph_types, record.name, info)
         if info[4] and len(notes) < 32:
             notes.add(info[4])
+        if info[4] and info[4].startswith(("sizeof_error:", "buffer_size_error:")):
+            budget.reasons.add("measurement_error")
         return i
 
     for label, obj, kind in roots:
@@ -677,11 +733,13 @@ def _scan_roots(roots, cfg, deadline=None, diag=None, gc_pool=None):
                 record.state = "context_unavailable"
                 continue
             record.state, record.target, record.error = _resolve_proxy_result(obj)
+            if record.state == "error":
+                budget.reasons.add("proxy_resolution_error")
             refs = (("._get_current_object()", record.target),) if record.state == "bound" else ()
         elif cfg["skip_infra"] and _is_infra(obj):
-            continue
+            refs = _infra_payload_edges(obj)
         else:
-            refs = _edge_iter(obj)
+            refs = _edge_iter(obj, cfg["preview"])
         try:
             for suffix, child in refs:
                 if not budget.alive():
@@ -703,6 +761,8 @@ def _scan_roots(roots, cfg, deadline=None, diag=None, gc_pool=None):
         if "max_edges" in budget.reasons or "max_objects" in budget.reasons:
             break
     graph_reasons = set(budget.reasons)
+    if any(n.proxy and n.state == "context_unavailable" for n in nodes):
+        graph_reasons.add("proxy_context_unavailable")
     if queue:
         graph_reasons.add("pending_objects")
     if diag.get("roots_truncated"):
@@ -791,6 +851,13 @@ def _scan_roots(roots, cfg, deadline=None, diag=None, gc_pool=None):
             break
 
     root_mask = (1 << nroots) - 1
+    foreign_mask = sum(1 << r for r, group in enumerate(groups)
+                       if any(not a["resolution_context_available"] for a in group["aliases"]))
+    if cfg["resolve_proxies"] and any(n.proxy and n.mask & foreign_mask for n in nodes):
+        # A wrapper resolved for a current-context root does not reveal its
+        # possibly different target for a foreign-context alias/root.
+        graph_reasons.add("proxy_context_unavailable")
+        graph_complete = False
     root_stats = [[0, 0, 0, 0] for _ in groups]  # bytes, objects, mapped, observed single-root
     proxy_stats = [[0, 0, 0] for _ in proxy_groups]
     union = {"python_bytes": 0, "native_bytes": 0, "mapped_bytes": 0,
@@ -903,14 +970,20 @@ def _scan_roots(roots, cfg, deadline=None, diag=None, gc_pool=None):
     if gc_pool is not None:
         for obj in gc_pool:
             if not budget.alive():
-                census_reasons.append("max_seconds")
+                census_reasons.extend(sorted(budget.reasons & {"max_seconds", "cancelled"}))
                 break
             if census_scanned >= cfg["max_census_objects"]:
                 census_reasons.append("max_census_objects")
                 break
             census_scanned += 1
             if id(obj) not in index:
-                _add_type(census_types, _typename(obj), _measure(obj, cfg))
+                info = _measure(obj, cfg)
+                _add_type(census_types, _typename(obj), info)
+                if info[4] and len(notes) < 32:
+                    notes.add(info[4])
+                if info[4] and info[4].startswith(("sizeof_error:", "buffer_size_error:")):
+                    if "measurement_error" not in census_reasons:
+                        census_reasons.append("measurement_error")
     census_rows = sorted(census_types.values(), key=lambda r: (-r["bytes"], r["type"]))
     graph_rows = sorted(graph_types.values(), key=lambda r: (-r["bytes"], r["type"]))
     top = cfg["top"]
@@ -934,7 +1007,7 @@ def _scan_roots(roots, cfg, deadline=None, diag=None, gc_pool=None):
                         "gc_objects_available": len(gc_pool) if gc_pool is not None else None,
                         "complete_for_scope": graph_complete and not census_reasons,
                         "truncated": not graph_complete or bool(census_reasons),
-                        "reasons": census_reasons, "types_total": len(census_rows),
+                        "reasons": sorted(set(census_reasons) | graph_reasons), "types_total": len(census_rows),
                         "types_grouped": "<other_types>" in census_types,
                         "types_omitted": max(0, len(census_rows) - top),
                         "bytes": sum(r["bytes"] for r in census_rows),
