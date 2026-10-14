@@ -1,0 +1,27 @@
+# 可选：更深度的分析工具（memwatch 本身**不需要**这些，按需装）
+#
+#     python -m pip install -r requirements-analyzers.txt
+#
+# 已在 Python 3.9 上验证可解析安装（pip --dry-run，含全部传递依赖）：
+#     memray 1.20.0 / filprofiler 2023.3.1 / scalene 2.3.0
+#     Pympler 1.1 / objgraph 3.6.2 / guppy3 3.1.5 / memory-profiler 0.61.0
+#
+# 这些解决 memwatch 明确做不到的两件事（见 README_INTERFACE.md 第 6 节限制 6）：
+#   1. 纯 C 库的 malloc（numpy / PIL / mmap / C 扩展）—— tracemalloc 语义上就看不到；
+#   2. 行级 / 峰值 / 泄漏视角，而不是「此刻快照」。
+#
+# 注意：memray / filprofiler / scalene / guppy3 是原生扩展，需要对应平台的 cp39 wheel；
+# 没有 wheel 时会尝试源码编译（需要 C 工具链）。装不上不影响 memwatch 使用。
+
+# —— 分配点与泄漏（覆盖 C 层 malloc）——
+memray>=1.10          # 分配火焰图 + --leaks 泄漏检测；memray run / memray attach <pid>
+filprofiler>=2023.3   # 峰值内存的行级归因；fil-profile run app.py
+scalene>=1.5          # 采样式行级 CPU/内存/泄漏，开销低；scalene --memory --leaks app.py
+
+# —— 对象级（gc 图口径，与 memwatch 互补）——
+pympler>=1.0          # asizeof 深尺寸 / SummaryTracker 差分
+objgraph>=3.5         # 类型统计 / 反向引用图 / show_growth
+guppy3>=3.1           # 支配树（真正「释放谁才能回收」的口径）
+
+# 内部索引源只收录到 0.61 线，故下限放到 0.61；4.x 的 @profile / mprof 用法与此一致
+memory_profiler>=0.61

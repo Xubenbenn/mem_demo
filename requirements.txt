@@ -1,0 +1,29 @@
+# memwatch 依赖清单
+#
+# 目标环境：CPython 3.9（已在 3.9.12 干净 venv 中安装并跑通全部 44 项测试）
+# 兼容范围：>= 3.7（另在 3.9 与 3.14 上验证过）
+#
+# ── 生产接入：什么都不用装 ────────────────────────────────────────────────
+# memwatch.py 是单文件、纯标准库实现。复制进项目即可：
+#     import memwatch
+#     memwatch.mark()
+# 下面两个包都是**可选**的，没装也能跑（走降级路径，test_modes.py 的 L 组用例专门验证）：
+#   * psutil   —— 没有时改用标准库 resource 拿 RSS（拿不到 USS，精度略低）
+#   * werkzeug —— 没有时用鸭子类型识别 LocalProxy（任何带 _get_current_object 的代理都能认）
+#
+# ── 跑本仓库的 demo 与测试：需要下面两个 ──────────────────────────────────
+# 只有 b.py（被依赖模块，对外暴露 LocalProxy）和 demo_run.py（用 psutil 量 RSS）需要它们。
+#
+#     python -m pip install -r requirements.txt
+#
+# 要完全锁定到「实测通过」的那一组，用：
+#     python -m pip install -r requirements-py39.lock.txt
+
+psutil>=5.8          # RSS/USS 读数；5.8 起 memory_info().uss 稳定可用
+werkzeug>=2.0        # LocalProxy / Local / LocalStack 场景
+
+# 实测通过的组合（Python 3.9.12）：
+#   psutil==7.2.2 + Werkzeug==3.1.9        → 44/44 通过
+#   psutil==5.8.0 + Werkzeug==2.0.3        → 44/44 通过（更旧的一组，同样兼容）
+# werkzeug 2.0 起 Local 改用 ContextVar 存值，这正是 README 里 LocalProxy 那条结论的前提；
+# 2.x 与 3.x 的 LocalProxy/Local/LocalStack 行为在本项目用到的范围内一致，两条线都测过。

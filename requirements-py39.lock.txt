@@ -1,0 +1,10 @@
+# 实测通过的确切版本组合 —— Python 3.9.12（干净 venv，从 requirements.txt 安装后 pip freeze）
+#
+#     python -m pip install -r requirements-py39.lock.txt
+#
+# 用途：想要可复现的环境时用这个；想要「自动跟着 3.9 兼容的最新版走」就用 requirements.txt。
+# 注意 MarkupSafe 是 Werkzeug 的传递依赖，一并锁定。
+
+MarkupSafe==3.0.4
+psutil==7.2.2
+Werkzeug==3.1.9
