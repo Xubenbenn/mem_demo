@@ -1,210 +1,76 @@
-# Python 进程内内存归因方案（含 LocalProxy / A 依赖 b 的场景）
+# memwatch：检查点式运行时内存诊断
 
-## 一句话结论
+在指定业务节点观察：哪些变量可达大量对象、哪些类型占多少已识别内存、哪些 LocalProxy 共享目标，以及哪些分配点发生变化。
 
-**有方案，但要先把问题拆成两条正交的线**，因为它们是不同的工具：
+**v2 部署必须同时复制 `memwatch.py` 和 `_memwatch_core.py`，或使用整个仓库。** 运行核心无强制第三方依赖。`memprobe.py` 是旧 API 的兼容入口，复用同一统计引擎。
 
-| 你想问的问题 | 归因方式 | 主力工具 |
-| --- | --- | --- |
-| 这 8 MiB 是**哪行代码分配**的 | 分配点归因（谁 malloc） | `tracemalloc` / memray / filprofiler / scalene |
-| 这 8 MiB 现在**被哪个变量持有** | 持有者归因（对象图 + 保留大小） | objgraph / pympler / guppy3 / 本仓库 `memprobe.py` |
-
-「每个变量占多少内存」**没有唯一答案**：内存是图不是树，同一个 list 可以被 5 个变量同时引用。
-所以只有三种可辩护的记账约定：
-
-- **exclusive / 贪心**：谁先被遍历到算谁的（`memprobe.retained_attribution` 用这个，顺序敏感但可复现）
-- **shared**：所有能到达它的根各记一份（会超算，但能暴露共享 —— LocalProxy 场景必须看这个）
-- **dominator**：按支配树算「释放谁才能真回收」（guppy3/heapy 的做法，最准也最慢）
-
----
-
-## 1. 工具矩阵（实测环境：CPython 3.9 / werkzeug 2.0.3）
-
-| 工具 | 回答什么 | 覆盖范围 | 开销 | 检查点用法 |
-| --- | --- | --- | --- | --- |
-| **tracemalloc**（标准库） | 分配点 + 调用栈，可做检查点差分 | 只覆盖 CPython 分配器；看不到纯 C 库的 `malloc` | 低（`frames=1` 可再降） | `PYTHONTRACEMALLOC=25` 或 `take_snapshot()` + `compare_to()` |
-| **memray** | 分配点火焰图、原生 C 分配、**泄漏模式** | `malloc` 全量，含 numpy / C 扩展 | 中 | `memray run --leaks app.py`、`memray attach <pid>` |
-| **filprofiler** | **峰值内存**的行级归因 | `malloc` 全量 | 高 | `fil-profile run app.py` |
-| **scalene** | 行级 CPU / 内存 / 泄漏，采样式 | 全量 | 低 | `scalene --memory --leaks app.py` |
-| **memory_profiler** | 逐行 RSS 增量 | 只有 RSS，分不清对象 | 高 | `@profile` / `mprof run` |
-| **pympler** | `asizeof` 深尺寸、`SummaryTracker` 差分 | gc 图（漏 str/bytes/ndarray） | 中 | `SummaryTracker()` 打点 |
-| **objgraph** | 类型统计、反向引用图、增长排名 | gc 图 | 低 | `show_growth()` / `show_backrefs()` |
-| **guppy3 / heapy** | 支配树、按引用者分类 | gc 图 | 中 | `hpy().heap()` |
-| **psutil** | 进程 RSS / USS 总量 | 全部（含 C 库） | 极低 | 定时线程打点，超阈值 dump |
-| **`memprobe.py`**（本仓库） | 检查点：分配点差分 + **变量维度持有量** + LocalProxy 解引用 | 两者结合 | 中 | `Probe().report("节点名", roots)` |
-
----
-
-## 2. 「执行到某个节点」怎么做：检查点 + 差分
-
-最可靠的形式是**两两差分**，而不是看绝对快照。
+## 最小接入
 
 ```python
-import memprobe as mp
+import memwatch
 
-probe = mp.Probe()                 # 内部 tracemalloc.start()
-
-probe.diff("节点1：加载配置")        # 分配点基线
-prepare()
-probe.diff("节点2：加载配置后")      # 相对节点1 的分配增量（精确到行）
-
-roots = mp.collect_roots(modules=[a, b])          # 模块全局变量 + 线程帧局部变量
-for line in probe.holders("节点2：持有者", roots):  # 变量维度保留大小
-    print(line)
+# 尽量在业务大对象分配前开启，分配点记录无法追溯开启之前的历史。
+memwatch.install(trace=True, on_signal=False)
+payload = [bytearray(1024 * 1024) for _ in range(8)]
+rep = memwatch.mark_all("加载完成")
 ```
 
-再加一个跨检查点的「新增对象」差分（对应 objgraph/pympler 的 growth）：
+`mark()` 默认扫描当前调用栈，使用 `profile="standard"`，包含持有者、代理和可达对象类型统计；尊重 `install(profile=...)`。`mark_all()` 默认 `all_profile="deep"`，增加 GC 普查、分配点状态和类型净变化。两者均可显式传 `profile`。
+
+定点缩小范围：
 
 ```python
-g = mp.Growth()
-handle_request()                       # 你怀疑泄漏的那个节点
-for name, own, atoms, cnt in g.diff(top=15):
-    print(f"{own/1024:8.1f} KiB 自身 + {atoms/1024:9.1f} KiB 非追踪对象  {cnt:6d} 个  {name}")
+memwatch.track("payload", payload)
+try:
+    rep = memwatch.mark_all("指定对象", roots_scope="tracked", max_seconds=10)
+finally:
+    memwatch.untrack("payload")
 ```
 
-> `atoms` 那一列是关键：`str` / `bytes` / `bytearray` / `numpy.ndarray` **不被 gc 追踪**，
-> 永远不会出现在 `gc.get_objects()` 里。少了这列，400 KiB 的 `bytearray` 只会显示成列表自身的 1 KiB。
+`track()` 默认强引用，会延长对象生命周期；可弱引用的对象可用 `track(name, obj, weak=True)`。不要把业务引用的自动删除交给监控器。
 
-自动触发（不想改业务代码）：
+## 如何读报告
 
-```bash
-PYTHONTRACEMALLOC=25 python app.py          # 从启动第一行就开始记录
-```
-
-```python
-# 或者按 RSS 阈值 dump：常驻线程 + psutil
-if psutil.Process().memory_info().rss > 800 * 1024 * 1024:
-    snap = tracemalloc.take_snapshot()      # 再 group_by("traceback") 落盘
-```
-
----
-
-## 3. LocalProxy 专题：A 依赖 b 定义的 LocalProxy
-
-`demo_run.py` 在真实 werkzeug `LocalProxy` + `Local` + `LocalStack` 上跑出的实测结论：
-
-### 事实 0：proxy 本身只有 56 字节
-
-```
-proxy 自身 sizeof          : 56
-proxy 的 slot 值           : ['Local', 'str', 'type']   # 真实数据不在里面
-len(a.proxy)               : 8                          # 但用起来像真对象
-```
-
-### 陷阱 A：用 `getattr` 走对象图 → 解引用过头 + 未绑定就崩
-
-`pympler.asizeof` 和部分 objgraph 用法是靠属性遍历的，而 `LocalProxy.__getattr__` 会把
-**所有**属性转发给真实对象，包括 `__dict__`：
-
-```
-getattr(proxy,'__dict__') 就是真实对象的 __dict__: True      # 绑定后：双重计数
-getattr(proxy,'__dict__')  : RuntimeError: no object bound to payload   # 未绑定时直接抛
-```
-
-### 陷阱 B：只用 `gc.get_referents` 走图 → **根本走不到数据**
-
-```
-proxy 出发的引用链         : LocalProxy(56B) -> Local(40B) -> ContextVar(80B) -> str(62B)
-这条链能到 payload 吗      : False
-```
-
-werkzeug ≥ 2.0 的 `Local` 改用 `ContextVar` 存值（`object.__setattr__(self, "_storage", ContextVar(...))`），
-值挂在**线程的 Context 内部 HAMT** 上，不在 Python 引用图里。于是「从变量出发」的遍历
-会把 8 MiB 判成不可达，或者干脆不统计。
-
-### 陷阱 C：`gc.get_objects()` 看得见对象，但溯源不回变量
-
-```
-payload 在 gc.get_objects() 里吗 : True
-payload 的 owner 链              : ['payload'] <- <hamt_bitmap_node> <- <hamt> <- <Context> <- <cell>
-```
-
-**按类型普查能看见字节，按变量归因必然错。** 这条链走进 `contextvars` 内部结构，
-永远指不回 `a.proxy` 或 `b.*`，`objgraph.find_backref_chain` / guppy3 的支配树都到不了根。
-
-### 正确做法：把 proxy 当「显式解引用边」处理
-
-```python
-def _referents(obj, resolve_proxies=True):
-    refs = gc.get_referents(obj)
-    if resolve_proxies and is_proxy(obj):
-        try:
-            target = obj._get_current_object()      # 唯一可靠的解引用方式
-        except Exception:                           # 未绑定上下文 -> RuntimeError
-            target = None                           # 必须吞掉，否则探针自己会崩业务
-        if target is not None and target is not obj:
-            refs = list(refs) + [target]            # 加一条「解引用边」
-    return refs
-```
-
-配套的三条纪律（`memprobe.py` 已实现）：
-
-1. **全局 `visited` 按 `id()` 去重**，否则解引用边会让同一棵子树被重复计算 N 次。
-2. **单列「proxy 共享」报告**：`probe.proxies()` 会告诉你 3 个 proxy 都解引用到同一份
-   8192.6 KiB —— 不然你会以为 3 个变量各占 8 MiB。
-3. **`_get_current_object()` 必须包 `try/except`**：request 上下文外解引用会抛
-   `RuntimeError`，很多分析工具就是在这里把被测程序搞崩的。
-
-实测对比（同一时刻、同一份 8 MiB 数据）：
-
-```
-[解引用=True（推荐）]                      [解引用=False（纯对象图）]
-  8194.6 KiB  16 obj  a.proxy               8192.6 KiB  9 obj  a.local_ref   <- 只是碰巧
-    1.0 KiB   1 obj  b.LocalStack             2.0 KiB   7 obj  a.proxy       <- 56 B 的壳
-    0.4 KiB   6 obj  b.stack_proxy            1.0 KiB   1 obj  b.LocalStack
-    ...
-  发现的 LocalProxy：3 个
-    自身 56 B x1   解引用后 8192.6 KiB  a.proxy
-    自身 56 B x1   解引用后 8192.6 KiB  a.lazy
-    自身 56 B x1   解引用后 8192.6 KiB  b.stack_proxy     <- 共享同一份，别重复相加
-```
-
-> 注意 `False` 那一列之所以还能看到 8192.6 KiB，是因为 demo 里 `a.local_ref` 恰好还留着一个直接引用。
-> 真实项目里 A 通常**只有 proxy**，这时纯对象图归因会诚实地告诉你「一切正常」。
-
----
-
-## 4. 三个把探针变成泄漏源的坑
-
-1. **探针自己持有强引用**：`roots` 列表、`tracemalloc` 快照里保留的 frame 局部变量、日志里的
-   `repr(obj)`。demo 第 6 步里 `del roots` 之前，8 MiB 死活不释放：
-   ```
-   释放 : 8.0 MiB     # del roots + 清空业务引用之后
-   ```
-2. **`sys.getsizeof` 只是自身**：`sys.getsizeof([b'x'*1024])` ≈ 64 B，不含元素。要深尺寸必须自己走图。
-3. **`gc.get_objects()` 不含原子类型**：实测本轮遍历里 `str` / `bytearray` 实例数都是 0。
-   按类型 census 会系统性少算；只能靠「容器可达 → `sys.getsizeof` 补算」的方式拿回来。
-
----
-
-## 5. 什么时候必须上外部工具
-
-- **numpy / PIL / mmap / C 扩展的大块内存**：`tracemalloc` 语义上就看不到纯 C 的 `malloc`，
-  上 `memray`（含 `--leaks`）或 `filprofiler`（峰值行级归因）。
-- **生产环境长期开启**：`Austin` / `py-spy` 采样式（低开销），或 `tracemalloc(frames=1)`
-  只保留分配点不保留栈，再配 RSS 阈值 dump。
-- **只要一个数**：`psutil` 的 RSS 定时打点，比任何对象级工具都便宜且不会骗你。
-
-安装（本项目实测环境里这些都还没装）：
-
-```bash
-pip install pympler objgraph guppy3 memory_profiler
-pip install memray filprofiler scalene    # 原生工具，需要编译
-```
-
----
-
-## 6. 本目录文件
-
-| 文件 | 作用 |
+| 字段 | 口径 |
 | --- | --- |
-| `memprobe.py` | 探针：分配点差分 / 变量持有量 / LocalProxy 解引用 / 类型普查 / 对象增长差分 / owner 链 |
-| `b.py` | 被依赖模块，只暴露 `LocalProxy` + `Local` + `LocalStack` |
-| `a.py` | 依赖方，只持有 proxy，不持有真实对象 |
-| `demo_run.py` | 复现上面所有实测结论的脚本 |
+| `holders[].bytes` / `reachable_bytes` | 此根可达的已观察对象大小；各行不可相加，不代表分配者或删除变量后的释放量 |
+| `holders[].aliases` / `references` | 同一对象的多个绑定及其作用域；主显示名称不是所有权判定 |
+| `totals.accounted_bytes` | 选定根图按对象身份去重后的估计总量 = `python_bytes + native_bytes` |
+| `totals.mapped_bytes` | 已识别映射的虚拟长度；独立列示，不等于 RSS，不加入上述总量 |
+| `types` / `type_totals` | 选定根图内的去重类型明细及总量 |
+| `census_details` / `census_meta` | standard 为可达图；deep 为 GC 对象与可达图的去重并集 |
+| `proxy_totals.targets_union_bytes` | 已识别代理目标图的去重并集，包括不同目标之间共享的子对象 |
+| `buffers` | NumPy / memoryview / mmap 的来源、逻辑长度、对象/缓冲区/映射字节 |
+| `sites` | 已追踪分配点或 unavailable / skipped / error；不是所有原生分配 |
+| `coverage` / `holders_truncated` | 预算、错误、作用域和完整性；不能把部分结果当作完整报告 |
+
+`top` 只限制显示行数；总量单独计算，报告包含 omitted 字段。`exclusive_bytes` 只指选定根身份组内观察到的非共享部分，不是支配树 retained size；截断时为 `null`。
+
+## 零改动启动与到点触发
 
 ```bash
-python3 demo_run.py
+MEMWATCH_AUTO=0 python -m memwatch run app.py
+MEMWATCH_AT=/absolute/path/app.py:handle_request python -m memwatch run app.py
+MEMWATCH_AT=/absolute/path/app.py:123 python -m memwatch run app.py
+PYTHONPATH=/path/to/mem_demo MEMWATCH_AUTO=1 MEMWATCH_OUT=./reports python app.py
 ```
 
-实测输出见本文第 3、4 节引用的片段。
+调用触发发生在函数入口；行触发发生在该行执行前。触发一次后撤销自己的钩子。不覆盖应用已有 debugger/profiler 或自定义 SIGUSR1 handler。第三方启动环境可能优先载入自己的 `sitecustomize`，此时应使用 CLI 或显式 `install()`，不能假定 PYTHONPATH 注入成功。
+
+## 范围与代价
+
+对象可达图、分配记录、进程 RSS 是三个不同视角，不构成可无条件相加的账本。NumPy 自有数据计一次，视图沿 base 回溯；memoryview 沿 exporter 回溯；mmap 只给映射长度。没有通用手段从任意 C malloc、GPU 内存或私有分配器反查全部 Python 持有者，本实现明确报告原生覆盖不完整。
+
+预算是协作式的。大堆图仍可能带来明显内存/延时开销，`gc.get_objects()`、扩展方法、代理 callable、tracemalloc 统计和输出无法被该预算强制打断。生产热路径使用 counters 或缩小 roots，deep 用于选定诊断节点。其他线程/任务的 ContextVar 代理不能用当前上下文伪造解析结果；在实际请求上下文内 `mark()` 更可靠。
+
+## 验证与资料
+
+```bash
+python -m pip install psutil werkzeug numpy   # 测试/演示用；不是运行核心的强制依赖
+MEMWATCH_AUTO=0 python test_modes.py
+# 等价：MEMWATCH_AUTO=0 python -m unittest discover -s tests -v
+```
+
+本次本地验证：CPython 3.13.5 / NumPy 2.3.5；75 tests，72 passed，3 skipped，退出码 0。跳过项是缺少 Werkzeug 的两个真实代理测试，以及被平台启动钩子遮蔽的 PYTHONPATH 注入测试；不是失败转为通过。CI 配置另覆盖 Python 3.9 / 3.11 / 3.13，结果以 GitHub Actions 实际运行记录为准。
+
+详细配置见 [README_INTERFACE.md](README_INTERFACE.md)，问题、设计与验证证据见 [docs/AUDIT.md](docs/AUDIT.md)。v1 原说明和顺序敏感的测试逐字保存在 `docs/legacy/`，只作历史参考，不是 v2 契约。

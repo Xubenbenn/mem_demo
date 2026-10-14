@@ -1,0 +1,36 @@
+name: Memory accounting regressions
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: '3.9'
+            werkzeug: 'werkzeug==2.0.3'
+            numpy: 'numpy==1.26.4'
+          - python: '3.11'
+            werkzeug: 'werkzeug>=3.1,<4'
+            numpy: 'numpy==2.3.5'
+          - python: '3.13'
+            werkzeug: 'werkzeug>=3.1,<4'
+            numpy: 'numpy==2.3.5'
+    env:
+      MEMWATCH_AUTO: '0'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install real integration dependencies
+        run: python -m pip install 'psutil>=5.8' '${{ matrix.werkzeug }}' '${{ matrix.numpy }}'
+      - name: Record runtime versions
+        run: python -m pip list
+      - name: Contract and integration tests
+        run: python test_modes.py

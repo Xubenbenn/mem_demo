@@ -1,13 +1,11 @@
-"""被依赖的模块 b：对外只暴露 LocalProxy，不暴露真实对象。"""
-
+"""被依赖的模块 b：对外暴露三种后端的 LocalProxy。"""
 from werkzeug.local import Local, LocalProxy, LocalStack
 
 _locals = Local()
 _stack = LocalStack()
 
-# 两种典型写法：属性后端 与 callable 后端（后者会带 __wrapped__）
 payload_proxy = LocalProxy(_locals, "payload")
-stack_proxy = LocalProxy(_stack, "top")
+stack_proxy = LocalProxy(_stack)  # LocalStack 后端直接代理栈顶，不查 payload.top
 lazy_proxy = LocalProxy(lambda: _locals.payload)
 
 

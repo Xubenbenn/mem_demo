@@ -1,409 +1,264 @@
-"""memprobe —— 进程内内存归因探针（标准库实现，werkzeug 可选）。
+"""Compatibility API backed by memwatch's bounded, identity-deduplicated engine.
 
-目标：在程序执行到某个「检查点」时，回答两个问题
-  1) 这块内存是「谁分配的」（分配点归因）-> tracemalloc
-  2) 这块内存现在「被哪个变量持有」（持有者归因）-> 对象图 + 保留大小
-
-注意：内存是「图」不是「树」。同一个 list 可以被 5 个变量同时引用，
-不存在唯一的数学答案，只有三种可辩护的约定：
-  - exclusive：谁先被遍历到算谁的（贪心，本次实现，顺序敏感但可复现）
-  - shared   ：所有能到达它的根都记一份（会超算，但能暴露共享）
-  - dominator：按支配树算真正「释放谁才能回收」-> guppy3/heapy 的做法
-
-LocalProxy 是一个动态间接节点，不在此列：它本身只占几十字节，
-真正的数据挂在 Local/LocalStack 的 __storage__ 里，
-所以任何纯对象图遍历都不会把内存算到 proxy 那个变量头上。
-本模块对此做了显式的「解引用边」处理，并在 report 里单列一节。
+Version 2 changes accounting semantics: reachable sizes are not additive or
+retained sizes; Growth reports type NET changes, not guessed new object IDs.
+Prefer memwatch.mark()/mark_all() for structured coverage and native-buffer data.
 """
-
 from __future__ import annotations
 
 import gc
 import sys
+import time
 import tracemalloc
-from collections import Counter
+import types
+import warnings
 
-# ---------------------------------------------------------------- 代理类型
+import memwatch as _mw
 
-try:  # werkzeug 可能不存在
-    from werkzeug.local import LocalProxy as _LocalProxy
-
-    PROXY_TYPES = (_LocalProxy,)
-except Exception:  # pragma: no cover
-    PROXY_TYPES = ()
-
-# 这些类型只统计自身，不向下遍历：否则第一个根（比如某函数）会把整个世界算成自己的
-INFRA_TYPES = (
-    type(sys),  # module
-    type,  # class
-    type(lambda: 0),  # function
-    type((lambda: 0).__code__),  # code
-    type(sys._getframe()),  # frame
-    type(sys._getframe().f_back),  # 同上，防御性
-)
+INFRA_TYPES = _mw._INFRA_TYPES
+shallow = _mw._sizeof
+is_proxy = _mw._is_proxy
+resolve_proxy = _mw._resolve_proxy
+_proxy_state = _mw._proxy_state
+def describe(obj, max_len=60):
+    return _mw._describe(obj, max_len)
 
 
-def shallow(obj) -> int:
-    """对象自身占用（不含其引用到的对象）。"""
-    try:
-        return sys.getsizeof(obj)
-    except TypeError:
-        return 0
-
-
-def is_proxy(obj) -> bool:
-    return bool(PROXY_TYPES) and isinstance(obj, PROXY_TYPES)
-
-
-def resolve_proxy(proxy):
-    """安全解引用 LocalProxy：解不开（未绑定上下文）返回 None，绝不抛异常。"""
-    try:
-        target = proxy._get_current_object()
-    except Exception:
-        return None
-    return None if target is proxy else target
-
-
-# ---------------------------------------------------------------- 根收集
-
-
-def roots_from_module(mod, include_private: bool = False):
-    """模块级变量作为根（这就是「变量」最常见的形态）。"""
-    out = []
-    for name, value in list(vars(mod).items()):
-        if name.startswith("__"):
-            continue
-        if not include_private and name.startswith("_"):
-            continue
-        out.append((f"{mod.__name__}.{name}", value))
-    return out
-
-
-def roots_from_frame(frame, prefix: str = ""):
-    """某个栈帧的局部变量 + 闭包变量。"""
-    where = f"{frame.f_code.co_filename}:{frame.f_lineno}:{frame.f_code.co_name}"
-    return [(f"{prefix}{where}:{name}", value) for name, value in list(frame.f_locals.items())]
-
-
-def roots_from_threads():
-    """当前进程所有线程的栈帧局部变量。"""
-    out = []
-    for tid, frame in list(sys._current_frames().items()):
-        out.extend(roots_from_frame(frame, prefix=f"thread{tid}:"))
-    return out
-
-
-def collect_roots(modules=None, include_threads: bool = True, include_private: bool = False):
-    """默认：所有非标准库模块的全局变量 + 所有线程的帧局部变量。"""
-    out = []
-    if modules is None:
-        modules = [
-            m
-            for name, m in list(sys.modules.items())
-            if m is not None and not name.startswith(("_", "importlib", "encodings"))
-        ]
-    for mod in modules:
-        try:
-            out.extend(roots_from_module(mod, include_private=include_private))
-        except Exception:
-            continue
-    if include_threads:
-        out.extend(roots_from_threads())
-    # 按 id 去重，保留第一个标签
-    dedup, seen = [], set()
-    for label, obj in out:
-        if id(obj) in seen:
-            continue
-        seen.add(id(obj))
-        dedup.append((label, obj))
-    return dedup
-
-
-# ---------------------------------------------------------------- 遍历核心
-
-
-def _referents(obj, resolve_proxies: bool):
-    refs = gc.get_referents(obj)
-    if resolve_proxies and is_proxy(obj):
-        target = resolve_proxy(obj)
-        if target is not None:
-            refs = list(refs) + [target]  # 显式「解引用边」
-    return refs
-
-
-def retained_attribution(roots, resolve_proxies: bool = True, skip_infra: bool = True,
-                         limit: int = 2_000_000):
-    """贪心保留大小归因：每个对象只算给「第一个到达它的根」。
-
-    返回 [(label, own_bytes, n_objects, is_proxy, proxy_state)]，按字节降序。
-    """
-    claimed = set()
+def roots_from_module(mod, include_private=False):
     rows = []
-    visited_total = 0
-    for label, root in roots:
-        stack = [root]
-        total = 0
-        count = 0
-        while stack:
-            obj = stack.pop()
-            oid = id(obj)
-            if oid in claimed:
-                continue
-            claimed.add(oid)
-            visited_total += 1
-            if visited_total > limit:
-                raise RuntimeError("对象图过大，请缩小根集合或降低 limit")
-            total += shallow(obj)
-            count += 1
-            if skip_infra and isinstance(obj, INFRA_TYPES):
-                continue
-            stack.extend(_referents(obj, resolve_proxies))
-        if total:
-            rows.append((label, total, count, is_proxy(root), _proxy_state(root)))
-    rows.sort(key=lambda r: r[1], reverse=True)
+    if not issubclass(type(mod), types.ModuleType):
+        return rows
+    for name, value in types.ModuleType.__getattribute__(mod, "__dict__").items():
+        if name.startswith("__") or (name.startswith("_") and not include_private):
+            continue
+        rows.extend((label, obj) for label, obj, _ in _mw._root_members(
+            mod.__name__ + "." + name, value, "module"))
     return rows
 
 
-def _proxy_state(obj) -> str:
-    if not is_proxy(obj):
-        return ""
-    return "bound" if resolve_proxy(obj) is not None else "unbound"
+def roots_from_frame(frame, prefix=""):
+    return [(prefix + _mw._frame_root(frame) + ":" + name, value)
+            for name, value in frame.f_locals.items() if not name.startswith("__")]
 
 
-def find_proxies(roots):
-    """找出根可达的所有 LocalProxy，并给出解析结果。"""
-    seen = set()
-    out = []
-    for label, root in roots:
-        stack = [root]
-        while stack:
-            obj = stack.pop()
-            oid = id(obj)
-            if oid in seen:
-                continue
-            seen.add(oid)
-            if is_proxy(obj):
-                out.append((label, obj))
-                continue  # proxy 内部结构不再深入，交给 resolve 处理
-            if isinstance(obj, INFRA_TYPES):
-                continue
-            stack.extend(gc.get_referents(obj))
-    return out
-
-
-def census(top: int = 25, min_bytes: int = 1) -> list:
-    """整个进程的堆对象普查：按类型统计实例数与自身占用。"""
-    counts, sizes = Counter(), Counter()
-    for obj in gc.get_objects():
-        t = type(obj)
-        try:
-            name = f"{t.__module__}.{t.__qualname__}"
-        except Exception:
-            name = repr(t)
-        counts[name] += 1
-        sizes[name] += shallow(obj)
-    rows = [(name, sizes[name], counts[name]) for name in sizes if sizes[name] >= min_bytes]
-    rows.sort(key=lambda r: r[1], reverse=True)
-    return rows[:top]
-
-
-def describe(obj, max_len: int = 60) -> str:
+def roots_from_threads():
+    cfg, _ = _mw._normalise_cfg(_mw.DEFAULT)
+    frame = _mw._caller_frame()
     try:
-        r = repr(obj)
-    except Exception as exc:
-        return f"<repr failed: {exc!r}>"
-    return r if len(r) <= max_len else r[: max_len - 3] + "..."
+        return [(label, obj) for label, obj, _ in
+                (_mw._roots_from_stack(cfg, frame) + _mw._roots_from_frames(cfg))]
+    finally:
+        del frame
 
 
-def owner_chain(obj, max_depth: int = 5, ignore_files=("memprobe.py",)):
-    """向上找「谁持有它」，优先给出 dict 的键名 / 帧里的变量名。
+def collect_roots(modules=None, include_threads=True, include_private=False):
+    """Returned roots themselves are strong references; discard them after use."""
+    cfg, _ = _mw._normalise_cfg(_mw.DEFAULT)
+    if modules is None:
+        rows = [(label, obj) for label, obj, _ in _mw._roots_from_modules(cfg)]
+    else:
+        rows = [row for mod in modules for row in roots_from_module(mod, include_private)]
+    if include_threads:
+        rows.extend(roots_from_threads())
+    return rows  # aliases deliberately retained
 
-    ignore_files：跳过探针自身的帧和容器，否则你会看到自己的采集代码。
+
+def _analysis(roots, resolve_proxies=True, skip_infra=True, limit=500_000, census=False):
+    cfg = dict(_mw.DEFAULT, max_objects=limit, resolve_proxies=resolve_proxies,
+               skip_infra=skip_infra, top=4096)
+    pool = gc.get_objects() if census else None
+    result = _mw._scan_roots([(name, obj, "tracked") for name, obj in roots], cfg, gc_pool=pool)
+    result.pop("_census_all", None)
+    return result
+
+
+def retained_attribution(roots, resolve_proxies=True, skip_infra=True, limit=2_000_000):
+    """Legacy tuple shape; v2 values are REACHABLE, not retained or additive.
+
+    A warning carries truncation because this legacy return type has no coverage
+    field. Use memwatch for a structured report with explicit completeness.
     """
-    chain = []
-    current = obj
-    seen = {id(obj)}
+    result = _analysis(roots, resolve_proxies, skip_infra, limit)
+    if result["holders_truncated"] or result["holders_omitted"]:
+        warnings.warn("memprobe attribution is partial; use memwatch coverage fields", RuntimeWarning, stacklevel=2)
+    return [(" / ".join(r["aliases"]), r["bytes"], r["objects"], r["is_proxy"], r["proxy_state"])
+            for r in result["holders"]]
 
-    def _skip(ref):
-        if id(ref) in seen:
-            return True
-        if isinstance(ref, type(sys._getframe())):  # frame
-            return any(ref.f_code.co_filename.endswith(f) for f in ignore_files)
-        return False
 
-    for _ in range(max_depth):
-        best = None
-        for ref in gc.get_referrers(current):
-            if _skip(ref):
+def _referents(obj, resolve_proxies=True):
+    if is_proxy(obj):
+        if resolve_proxies:
+            state, target, _ = _mw._resolve_proxy_result(obj)
+            if state == "bound":
+                return [target]
+        return []
+    return list(_mw._children(obj))
+
+
+def find_proxies(roots, limit=500_000, max_seconds=5.0):
+    """Legacy strong-reference results; traversal is now bounded."""
+    seen, rows, edges = set(), [], 0
+    deadline = time.monotonic() + max_seconds
+    for label, root in roots:
+        stack = [iter((root,))]
+        while stack:
+            if len(seen) >= limit or edges >= limit * 4 or time.monotonic() >= deadline:
+                warnings.warn("memprobe proxy discovery is partial", RuntimeWarning, stacklevel=2)
+                return rows
+            try:
+                obj = next(stack[-1])
+                edges += 1
+            except StopIteration:
+                stack.pop()
                 continue
-            if isinstance(ref, dict):
-                key = next((k for k, v in list(ref.items()) if v is current), None)
-                if key is not None:
-                    best = ("dict", ref, key)
-                    break
-            if isinstance(ref, (list, tuple, set)):
-                best = ("seq", ref, None)
-                break
-        if best is None:
-            for ref in gc.get_referrers(current):
-                if _skip(ref):
-                    continue
-                best = ("other", ref, None)
-                break
-        if best is None:
+            except Exception:
+                stack.pop()
+                continue
+            if id(obj) in seen:
+                continue
+            seen.add(id(obj))
+            if is_proxy(obj):
+                rows.append((label, obj))
+            elif not _mw._is_infra(obj):
+                stack.append(iter(_mw._children(obj)))
+    return rows
+
+
+def census(top=25, min_bytes=1):
+    result = _analysis(collect_roots(), census=True)
+    if result["census_meta"]["truncated"]:
+        warnings.warn("memprobe census is partial; not total process memory", RuntimeWarning, stacklevel=2)
+    return [row for row in result["census"] if row[1] >= min_bytes][:top]
+
+
+def owner_chain(obj, max_depth=5, ignore_files=("memprobe.py",), max_seconds=0.2):
+    """Bounded heuristic only, NOT evidence of allocation or exclusive ownership.
+
+    gc.get_referrers itself is non-preemptible. No application repr is invoked.
+    """
+    parts, seen = [], {id(obj)}
+    current = obj
+    deadline = time.monotonic() + max_seconds
+    for _ in range(max_depth):
+        if time.monotonic() >= deadline:
+            parts.append("<time limit>")
             break
-        kind, ref, key = best
-        seen.add(id(ref))
-        if kind == "dict":
-            chain.append(f"[{key!r}]")
-        elif kind == "seq":
-            chain.append(f"<{type(ref).__name__}>")
-        elif isinstance(ref, INFRA_TYPES) and type(ref) is type(sys._getframe()):
-            chain.append(f"<frame {ref.f_code.co_filename}:{ref.f_lineno}:{ref.f_code.co_name}>")
-        else:
-            chain.append(f"<{type(ref).__name__} {describe(ref, 40)}>")
-        current = ref
-    return " <- ".join(chain)
-
-
-# ---------------------------------------------------------------- 对象差分
+        selected = None
+        for ref in gc.get_referrers(current)[:10000]:
+            if id(ref) in seen:
+                continue
+            if type(ref) is types.FrameType:
+                if any(ref.f_code.co_filename.endswith(f) for f in ignore_files):
+                    continue
+            if type(ref) is dict:
+                if ref is globals() or ref is vars(_mw):
+                    continue
+                for key, value in ref.items():
+                    if time.monotonic() >= deadline:
+                        break
+                    if value is current:
+                        selected = (ref, "[" + _mw._safe_preview(key) + "]")
+                        break
+            elif type(ref) in (list, tuple, set):
+                selected = (ref, "<" + type(ref).__name__ + ">")
+            if selected:
+                break
+        if selected is None:
+            break
+        current, label = selected
+        seen.add(id(current))
+        parts.append(label)
+    return "heuristic: " + " <- ".join(parts)
 
 
 class Growth:
-    """跨检查点的「新增对象」差分：只存 id，不持有对象（否则探针自己就是泄漏源）。
+    """Net type sizes/counts, not new object identity (ids can be reused).
 
-    两个必须知道的坑：
-      * str/bytes/bytearray/numpy.ndarray 不被 gc 追踪，永远不会出现在 gc.get_objects()
-        里。所以本类额外统计「新对象直接引用到的非追踪对象」字节数（atoms 列），
-        否则 400 KiB 的 bytearray 会只剩下列表本身的 1 KiB。
-      * CPython 会复用 id：两次快照之间大量释放对象时可能误判。要求严格时用
-        pympler.SummaryTracker 或 Probe.holders 的持有者视角。
-
-    diff() 返回 [(类型名, 自身字节, 直接持有的非追踪对象字节, 个数)]。
+    Legacy tuple shape: (type, NET bytes, 0, NET count). The old atoms column is
+    zero because untracked reachable objects now have their OWN deduplicated type.
+    A truncated census never advances the baseline.
     """
-
     def __init__(self):
-        gc.collect()
-        objs = gc.get_objects()
-        self.base = set()
-        skip = {id(objs), id(self.base), id(self)}
-        self.base.update(id(o) for o in objs if id(o) not in skip)
+        self.base = self._inventory()
 
     @staticmethod
-    def _atom_bytes(obj) -> int:
-        total = 0
-        for ref in gc.get_referents(obj):
-            if not gc.is_tracked(ref):
-                total += shallow(ref)
-        return total
+    def _inventory():
+        result = _analysis(collect_roots(), census=True)
+        if result["census_meta"]["truncated"] or result["census_meta"]["types_omitted"]:
+            warnings.warn("incomplete type census; growth baseline not advanced", RuntimeWarning, stacklevel=3)
+            return None
+        return {name: (size, count) for name, size, count in result["census"]}
 
-    def diff(self, top: int = 15, advance: bool = False):
-        gc.collect()
-        objs = gc.get_objects()
-        skip = {id(objs), id(self.base), id(self)}
-        fresh = [o for o in objs if id(o) not in self.base and id(o) not in skip]
-        agg = {}
-        for obj in fresh:
-            t = type(obj)
-            key = f"{getattr(t, '__module__', '?')}.{getattr(t, '__qualname__', t.__name__)}"
-            slot = agg.setdefault(key, [0, 0, 0])  # count, own, atoms
-            slot[0] += 1
-            slot[1] += shallow(obj)
-            slot[2] += self._atom_bytes(obj)
-        if advance:
-            self.base.update(id(o) for o in objs)
-        rows = [(k, v[1], v[2], v[0]) for k, v in agg.items()]
-        rows.sort(key=lambda r: r[1] + r[2], reverse=True)
-        return rows[:top]
-
-
-# ---------------------------------------------------------------- 检查点
+    def diff(self, top=15, advance=False):
+        now = self._inventory()
+        if now is None:
+            return []
+        rows = []
+        if self.base is not None:
+            for name in set(now) | set(self.base):
+                before, after = self.base.get(name, (0, 0)), now.get(name, (0, 0))
+                if before != after:
+                    rows.append((name, after[0] - before[0], 0, after[1] - before[1]))
+        if advance or self.base is None:
+            self.base = now
+        return sorted(rows, key=lambda r: -abs(r[1]))[:top]
 
 
 class Probe:
-    """检查点式探针：在每个「节点」打一次快照，跑完出增量报告。"""
-
-    def __init__(self, frames: int = 25, trace: bool = True):
-        self.frames = frames
-        self.trace = trace
-        self.prev = None
-        self.marks = []
-        if trace and not tracemalloc.is_tracing():
+    def __init__(self, frames=25, trace=True):
+        self.frames, self.trace, self.prev, self.marks = frames, trace, None, []
+        self._owned = trace and not tracemalloc.is_tracing()
+        if self._owned:
             tracemalloc.start(frames)
 
-    # -- 分配点归因 ------------------------------------------------------
     def snapshot(self):
-        if not self.trace:
-            return None
-        gc.collect()
-        return tracemalloc.take_snapshot()
+        return tracemalloc.take_snapshot() if self.trace and tracemalloc.is_tracing() else None
 
-    def diff(self, label: str, top: int = 15, group: str = "lineno"):
+    def diff(self, label, top=15, group="lineno"):
         snap = self.snapshot()
         if snap is None:
             return []
-        base = self.prev
-        self.prev = snap
-        if base is None:
-            stats = snap.statistics(group)
-            head = f"[{label}] 初始快照（相对进程启动）"
-        else:
-            stats = snap.compare_to(base, group)
-            head = f"[{label}] 相对上一个检查点的增量"
-        lines = [head]
-        for st in stats[:top]:
-            if base is not None and st.size_diff == 0:
-                continue
-            where = str(st.traceback) if hasattr(st, "traceback") else ""
-            if base is None:
-                lines.append(f"  {st.size / 1024:10.1f} KiB  {st.count:8d} 处  {where}")
-            else:
-                lines.append(
-                    f"  {st.size_diff / 1024:+10.1f} KiB  {st.count_diff:+8d} 处  {where}"
-                )
+        before, self.prev = self.prev, snap
+        stats = snap.compare_to(before, group) if before is not None else snap.statistics(group)
+        lines = ["[%s] %s (only traced allocations)" % (label, "delta" if before else "absolute")]
+        for st in [st for st in stats if not _mw._is_self_trace(st)][:top]:
+            size = st.size_diff if before else st.size
+            count = st.count_diff if before else st.count
+            lines.append("  %+.1f KiB  %+d allocations  %s" % (size / 1024, count, st.traceback))
         return lines
 
-    # -- 持有者归因 ------------------------------------------------------
-    def holders(self, label: str, roots, top: int = 15, resolve_proxies: bool = True,
-                skip_infra: bool = True):
-        rows = retained_attribution(roots, resolve_proxies=resolve_proxies, skip_infra=skip_infra)
-        lines = [f"[{label}] 变量持有量（贪心保留大小，共 {len(rows)} 个非空根）"]
-        for name, total, count, proxied, state in rows[:top]:
-            flag = f"  <LocalProxy:{state}>" if proxied else ""
-            lines.append(f"  {total / 1024:10.1f} KiB  {count:7d} obj  {name}{flag}")
+    @staticmethod
+    def _holder_lines(label, result, top):
+        lines = ["[%s] reachable bytes; NOT additive or retained; partial=%s" % (label, result["holders_truncated"])]
+        for row in result["holders"][:top]:
+            lines.append("  %.1f KiB  %s" % (row["bytes"] / 1024, " / ".join(row["aliases"])))
         return lines
 
-    def proxies(self, label: str, roots):
-        rows = find_proxies(roots)
-        lines = [f"[{label}] 发现的 LocalProxy：{len(rows)} 个"]
-        if not rows:
-            return lines
-        agg = {}
-        for owner, p in rows:
-            key = (owner, type(p).__name__)
-            agg.setdefault(key, [0, 0, 0])
-            state = _proxy_state(p)
-            tgt = resolve_proxy(p)
-            deep = 0
-            if tgt is not None:
-                deep = sum(r[1] for r in retained_attribution([("t", tgt)]))
-            agg[key][0] += 1
-            agg[key][1] += shallow(p)
-            agg[key][2] = max(agg[key][2], deep)
-        for (owner, tname), (n, own, deep) in sorted(agg.items(), key=lambda kv: -kv[1][2]):
-            lines.append(
-                f"  自身 {own:5d} B x{n:<3d} 解引用后 {deep / 1024:9.1f} KiB  {owner}  ({tname})"
-            )
+    @staticmethod
+    def _proxy_lines(label, result):
+        lines = ["[%s] proxy targets deduplicated union: %s B; partial=%s" %
+                 (label, result["proxy_totals"]["targets_union_bytes"], result["proxy_totals"]["truncated"])]
+        for row in result["proxies"]:
+            lines.append("  state=%s wrappers=%d target=%s B aliases=%s" %
+                         (row["state"], row["proxy_count"], row["target_bytes"], row["proxies"]))
         return lines
 
-    def report(self, label: str, roots=None, top: int = 15):
-        print("\n" + "=" * 78)
-        print(f"### 检查点 {label}")
-        print("=" * 78)
-        for line in self.diff(label, top=top):
-            print(line)
+    def holders(self, label, roots, top=15, resolve_proxies=True, skip_infra=True):
+        return self._holder_lines(label, _analysis(roots, resolve_proxies, skip_infra), top)
+
+    def proxies(self, label, roots):
+        return self._proxy_lines(label, _analysis(roots))
+
+    def report(self, label, roots=None, top=15):
+        lines = self.diff(label, top)
         if roots is not None:
-            for line in self.holders(label, roots, top=top):
-                print(line)
-            for line in self.proxies(label, roots):
-                print(line)
+            result = _analysis(roots)
+            lines.extend(self._holder_lines(label, result, top))
+            lines.extend(self._proxy_lines(label, result))
+        print("\n".join(lines))
+
+    def close(self):
+        self.prev = None
+        if self._owned and tracemalloc.is_tracing() and tracemalloc.get_traceback_limit() == self.frames:
+            tracemalloc.stop()
+        self._owned = False
