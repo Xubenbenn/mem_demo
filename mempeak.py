@@ -34,6 +34,7 @@ import functools
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -693,7 +694,7 @@ class _Monitor:
             rep = Report(
                 tool="mempeak", version=__version__, status=status,
                 mode="in-process" if self.pid is None else "external",
-                label=self.label, command=self.command,
+                label=self.label, command=self.command, resolved_command=getattr(self, "resolved_command", None),
                 pid=self.pid or os.getpid(), host=os.uname().nodename if hasattr(os, "uname") else None,
                 python=sys.version.split()[0], started_at=self.wall0,
                 duration_s=round(now - self.t0, 4), interval_s=self.interval, samples=self.samples,
@@ -826,11 +827,34 @@ class phase(contextlib.ContextDecorator):
 
 
 # --------------------------------------------------------------------------- external runner
+def resolve_command(cmd):
+    """Return (argv, note): a bare `python` means the interpreter running mempeak (and its venv).
+
+    Otherwise a bare `python` is resolved by the OS, independently of the interpreter running us:
+    via PATH on POSIX (the system Python when the venv is not activated) and, on Windows, first in
+    the directory of the *base* python.exe that a venv launcher runs, even with the venv activated.
+    Other bare names are resolved through PATH up front for the same reason.
+    """
+    first = cmd[0]
+    if os.path.basename(first) != first:
+        return list(cmd), None                      # explicit path: use as given
+    stem = first.lower()[:-4] if first.lower().endswith(".exe") else first.lower()
+    if stem in ("python", "python3", "python%d.%d" % sys.version_info[:2]) and sys.executable:
+        return [sys.executable] + list(cmd[1:]), "%s -> %s (the interpreter running mempeak)" % (
+            first, sys.executable)
+    found = shutil.which(first)
+    if found and sys.platform == "win32":
+        return [found] + list(cmd[1:]), "%s -> %s (resolved via PATH)" % (first, found)
+    return list(cmd), None
+
+
 def run_command(cmd, interval=0.02, out=None, flush_every=1.0, pss=False, label=None,
-                kill_above=None, quiet=False):
+                kill_above=None, quiet=False, resolve=True):
     """Run cmd as a child, monitor its whole process tree, return (Report, exit_code)."""
     if not cmd:
         raise ValueError("no command given")
+    original = list(cmd)
+    cmd, resolved_note = resolve_command(cmd) if resolve else (list(cmd), None)
     fd, phase_file = tempfile.mkstemp(prefix="mempeak-phases-", suffix=".tsv")
     os.close(fd)
     env = dict(os.environ)
@@ -843,6 +867,10 @@ def run_command(cmd, interval=0.02, out=None, flush_every=1.0, pss=False, label=
     mon = _Monitor(interval=interval, out=out, flush_every=flush_every, pss=pss, pid=proc.pid,
                    tree=True, label=label, command=list(cmd), quiet=quiet)
     mon._phase_file = phase_file
+    mon.command = original
+    if resolved_note:
+        mon.notes.append("command: " + resolved_note + "; use --no-resolve to run it literally")
+        mon.resolved_command = cmd
     killed = {"by_us": False}
     if kill_above:
         def guard(value, _t):
@@ -973,6 +1001,9 @@ def main(argv=None):
                    help="kill the command once sampled RSS exceeds SIZE (simulate a memory limit "
                         "without risking the machine)")
     r.add_argument("--quiet", "-q", action="store_true", help="do not print the summary")
+    r.add_argument("--no-resolve", action="store_true",
+                   help="run the command literally; by default a bare `python` means the interpreter "
+                        "running mempeak, so the current venv and its packages are used")
     r.add_argument("command", nargs=argparse.REMAINDER)
     c = sub.add_parser("compare", help="compare two JSON reports (before/after an optimisation)")
     c.add_argument("before")
@@ -996,7 +1027,7 @@ def main(argv=None):
     if not cmd:
         ap.error("run: missing command (python -m mempeak run -- python app.py)")
     rep, code = run_command(cmd, interval=args.interval, out=args.out, pss=args.pss, label=args.label,
-                            kill_above=args.kill_above, quiet=args.quiet)
+                            kill_above=args.kill_above, quiet=args.quiet, resolve=not args.no_resolve)
     if not args.quiet:
         print(rep.summary(), file=sys.stderr)
         if args.out:

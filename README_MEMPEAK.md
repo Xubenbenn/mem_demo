@@ -17,6 +17,15 @@ python -m mempeak compare before.json after.json
 - 目标即使被 OOM killer 杀掉（SIGKILL），监控进程仍然存活，照样输出报告，并标注 `likely_oom`。
 - `--out` 的 JSON 在运行期间每秒刷新一次，监控进程本身被杀也能留下最后的峰值。
 
+**虚拟环境**：`--` 后面的裸 `python` / `python3` 会被替换成**运行 mempeak 的那个解释器**（`sys.executable`），所以用哪个 venv 的 python 启动 mempeak，目标就跑在哪个 venv 里，不需要先激活：
+
+```bash
+.venv/bin/python -m mempeak run -- python train.py          # Linux/macOS
+.venv\Scripts\python -m mempeak run -- python train.py       # Windows
+```
+
+否则 `python` 由操作系统自行查找，与 mempeak 用的解释器无关：POSIX 上按 `PATH`（venv 没激活时就是系统 Python）；Windows 上 `CreateProcess` 会先在“当前进程可执行文件所在目录”里找，而 venv 的 `python.exe` 只是启动器，真正运行的是基础安装的 `python.exe`，所以**即使激活了 venv 也会拿到基础安装的 Python**，venv 里装的依赖全部不可见。替换会写进报告的 notes 和 `resolved_command`；其他裸命令名（如 `torchrun`）在 Windows 上预先按 `PATH` 解析；写了路径的命令原样执行；`--no-resolve` 关闭替换。
+
 常用选项：
 
 | 选项 | 作用 |

@@ -191,6 +191,39 @@ class CrossPlatformTests(unittest.TestCase):
         self.assertEqual(rep["status"], "killed")
 
 
+class VenvResolutionTests(unittest.TestCase):
+    """`python -m mempeak run -- python ...` must run the child in mempeak's own venv, activated or not."""
+
+    def test_bare_python_uses_the_interpreter_running_mempeak(self):
+        with tempfile.TemporaryDirectory() as d:
+            venv_dir = os.path.join(d, "venv")
+            subprocess.run([sys.executable, "-m", "venv", "--without-pip", venv_dir], check=True)
+            bindir = "Scripts" if sys.platform == "win32" else "bin"
+            venv_python = os.path.join(venv_dir, bindir, "python.exe" if sys.platform == "win32" else "python")
+            env = {k: v for k, v in os.environ.items() if k not in ("VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH")}
+            child = "import sys; print('PREFIX=' + sys.prefix)"
+            runs = {}
+            for extra in ([], ["--no-resolve"]):
+                r = subprocess.run([venv_python, os.path.join(ROOT, "mempeak.py"), "run", "-q"] + extra +
+                                   ["--", "python", "-c", child], env=env, capture_output=True, text=True)
+                line = [x for x in r.stdout.splitlines() if x.startswith("PREFIX=")]
+                runs[bool(extra)] = (r.returncode, line[0][7:] if line else None, r.stderr)
+            code, prefix, err = runs[False]
+            self.assertEqual(code, 0, err)
+            self.assertEqual(os.path.realpath(prefix), os.path.realpath(venv_dir))
+            # literal mode keeps the old OS lookup, which does not land in the (unactivated) venv
+            if runs[True][1] is not None:
+                self.assertNotEqual(os.path.realpath(runs[True][1]), os.path.realpath(venv_dir))
+
+    def test_explicit_paths_are_untouched(self):
+        argv, note = mempeak.resolve_command([sys.executable, "-V"])
+        self.assertEqual(argv, [sys.executable, "-V"])
+        self.assertIsNone(note)
+        argv, note = mempeak.resolve_command(["python3", "x.py"])
+        self.assertEqual(argv, [sys.executable, "x.py"])
+        self.assertIn("python3", note)
+
+
 class WindowsCompatTests(unittest.TestCase):
     """Windows has no signal.SIGKILL, no OOM killer, and reads memory only through psutil."""
 
