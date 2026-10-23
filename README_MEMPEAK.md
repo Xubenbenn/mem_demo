@@ -107,6 +107,18 @@ def train(): ...
 - 采样会漏掉间隙中的尖峰：单进程有内核 HWM 兜底；多进程的“同时刻求和”只能靠采样，建议缩短 `--interval`。
 - RSS 求和会重复计算 fork 共享页，用 `--pss` 修正。
 - 未开启 `exact_phases` 时，阶段峰值是采样值；嵌套阶段的外层峰值包含内层。
-- 非 Linux 平台：需要 psutil 才能采样当前 RSS 与子进程，cgroup 信息不可用。
+- 非 Linux 平台：**必须 `pip install psutil`**，否则读不到内存（会打印警告并写入 notes，而不是静默给出 n/a）；cgroup 信息不可用。
+
+## 7. Windows
+
+```bat
+pip install psutil
+python -m mempeak run --out before.json -- python train.py
+```
+
+- 采样的 RSS 是工作集（working set），`kernel HWM` 来自 psutil 的 `peak_wset`。
+- 额外报告 **`peak commit`**（`peak_pagefile`，私有提交内存）：Windows 没有 OOM killer，内存不足时是分配失败（Python 抛 `MemoryError`，退出码 1），触发条件是系统提交上限，所以在 Windows 上判断优化效果优先看这一项。`compare` 也会比较它。
+- `--kill-above` 用 TerminateProcess 结束整个进程树；不存在 `likely_oom` 判定。
+- 子进程退出后读不到它的峰值，最后一个采样间隔内的增长可能漏掉；需要更准时缩小 `--interval`。
 
 演示：`examples/peak_demo.py`（同一任务的优化前/后两个版本）。测试：`tests/test_mempeak.py`。

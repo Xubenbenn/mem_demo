@@ -1,17 +1,26 @@
 """Contract tests for mempeak (whole-run peak memory monitor)."""
+import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
+from unittest import mock
 
 import mempeak
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LINUX = sys.platform.startswith("linux") and os.path.exists("/proc/self/statm")
 MiB = 1024 * 1024
+try:
+    import psutil  # noqa: F401
+    HAVE_PSUTIL = True
+except ImportError:
+    HAVE_PSUTIL = False
 
 
 def _touch(n_mib):
@@ -146,6 +155,79 @@ class ExternalTests(unittest.TestCase):
             r = subprocess.run(cli + ["run", "-q", "--fail-above", "10M", "--", sys.executable, script,
                                       "--mb", "40"], cwd=ROOT, capture_output=True)
             self.assertEqual(r.returncode, 3)
+
+
+@unittest.skipUnless(LINUX or HAVE_PSUTIL, "needs /proc or psutil")
+class CrossPlatformTests(unittest.TestCase):
+    """Real processes, no mocks: runs on Linux, and on Windows/macOS when psutil is installed (CI)."""
+
+    def test_in_process_peak(self):
+        with mempeak.monitor(interval=0.01, print_summary=False) as m:
+            base = mempeak.rss_bytes()
+            buf = _touch(64)
+            time.sleep(0.05)
+            del buf
+        self.assertIsNotNone(base)
+        self.assertGreaterEqual(m.report.peak_bytes - base, 56 * MiB)
+        if sys.platform == "win32":
+            self.assertGreaterEqual(m.report["peak"]["commit_bytes"], 64 * MiB)
+
+    def test_run_exit_code_and_peak(self):
+        code = ("import sys, time\nb = bytearray(64 << 20)\nb[::4096] = b'x' * len(b[::4096])\n"
+                "time.sleep(0.3)\nsys.exit(5)\n")
+        rep, rc = mempeak.run_command([sys.executable, "-c", code], interval=0.01)
+        self.assertEqual(rc, 5)
+        self.assertEqual(rep["status"], "exited")
+        self.assertGreaterEqual(rep.peak_bytes, 60 * MiB)
+
+    def test_kill_above(self):
+        code = "import time\nb = bytearray(300 << 20)\nb[::4096] = b'x' * len(b[::4096])\ntime.sleep(10)\n"
+        t0 = time.monotonic()
+        rep, rc = mempeak.run_command([sys.executable, "-c", code], interval=0.01, kill_above=64 * MiB)
+        self.assertLess(time.monotonic() - t0, 8)
+        self.assertNotEqual(rc, 0)
+        self.assertTrue(rep["exit"]["killed_by_mempeak"])
+        self.assertFalse(rep["exit"]["likely_oom"])
+        self.assertEqual(rep["status"], "killed")
+
+
+class WindowsCompatTests(unittest.TestCase):
+    """Windows has no signal.SIGKILL, no OOM killer, and reads memory only through psutil."""
+
+    @unittest.skipUnless(LINUX, "spawns a real child")
+    def test_kill_above_without_sigkill(self):
+        code = "import time\nb = bytearray(200 << 20); b[::4096] = b'x' * len(b[::4096]); time.sleep(5)\n"
+        with mock.patch.object(mempeak, "_SIGKILL", None):
+            rep, rc = mempeak.run_command([sys.executable, "-c", code], interval=0.01, kill_above=64 * MiB)
+        self.assertEqual(rc, -signal.SIGTERM)          # the fallback TerminateProcess path
+        self.assertTrue(rep["exit"]["killed_by_mempeak"])
+        self.assertFalse(rep["exit"]["likely_oom"])
+        self.assertEqual(rep["status"], "killed")
+
+    def test_sigkill_attribute_is_optional(self):
+        with open(mempeak.__file__, encoding="utf-8") as f:
+            self.assertNotIn("signal.SIGKILL", f.read())
+
+    def test_commit_peak_from_psutil_on_windows(self):
+        info = types.SimpleNamespace(rss=10 * MiB, peak_wset=12 * MiB, peak_pagefile=30 * MiB)
+        fake = types.SimpleNamespace(Process=lambda pid=None: types.SimpleNamespace(memory_info=lambda: info))
+        with mock.patch.object(sys, "platform", "win32"), mock.patch.object(mempeak, "_LINUX", False), \
+                mock.patch.object(mempeak, "_psutil", lambda: fake), mock.patch.dict(sys.modules, {"resource": None}):
+            self.assertEqual(mempeak.commit_peak_bytes(), 30 * MiB)
+            self.assertEqual(mempeak.rss_bytes(), 10 * MiB)
+            with mempeak.monitor(interval=0.01, print_summary=False) as m:
+                time.sleep(0.03)
+        self.assertEqual(m.report["peak"]["commit_bytes"], 30 * MiB)
+        self.assertEqual(m.report["peak"]["hwm_bytes"], 12 * MiB)
+        self.assertIn("peak commit", m.report.summary())
+
+    def test_missing_psutil_is_reported_not_silent(self):
+        with mock.patch.object(mempeak, "_LINUX", False), mock.patch.object(mempeak, "_psutil", lambda: None), \
+                mock.patch.object(sys, "platform", "win32"), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            with mempeak.monitor(interval=0.01, print_summary=False) as m:
+                pass
+        self.assertIn("pip install psutil", err.getvalue())
+        self.assertTrue(any("psutil" in n for n in m.report["notes"]))
 
 
 class HelperTests(unittest.TestCase):

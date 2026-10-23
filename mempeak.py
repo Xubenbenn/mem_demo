@@ -51,6 +51,7 @@ try:
 except (AttributeError, ValueError, OSError):
     _PAGE = 4096
 _PHASE_ENV = "MEMPEAK_PHASE_FILE"
+_SIGKILL = getattr(signal, "SIGKILL", None)   # POSIX only; absent on Windows
 _MAX_TIMELINE = 2000
 _UNITS = {"": 1, "B": 1, "K": 1024, "KB": 1024, "KIB": 1024, "M": 1024 ** 2, "MB": 1024 ** 2,
           "MIB": 1024 ** 2, "G": 1024 ** 3, "GB": 1024 ** 3, "GIB": 1024 ** 3,
@@ -118,6 +119,28 @@ def hwm_bytes(pid=None):
         except Exception:
             return None
     return None
+
+
+def commit_peak_bytes(pid=None):
+    """Windows: peak commit charge (private bytes incl. pagefile) of a process, or None elsewhere.
+
+    On Windows allocations fail (MemoryError) when the system commit limit is reached, so this,
+    not the working set, is the number that predicts "out of memory" there. Needs psutil.
+    """
+    if sys.platform != "win32":
+        return None
+    ps = _psutil()
+    if ps is None:
+        return None
+    try:
+        return getattr((ps.Process(pid) if pid else ps.Process()).memory_info(), "peak_pagefile", None)
+    except Exception:
+        return None
+
+
+def _kill(pid):
+    # On Windows os.kill() with a non-console signal calls TerminateProcess.
+    os.kill(pid, _SIGKILL if _SIGKILL is not None else signal.SIGTERM)
 
 
 def _pss_bytes(pid):
@@ -318,6 +341,9 @@ class Report(dict):
             lines.append("  ├ sampled PSS   %s" % _fmt(p.get("pss_bytes")))
         if p.get("python_heap_bytes") is not None:
             lines.append("  ├ Python heap   %s   (tracemalloc peak)" % _fmt(p.get("python_heap_bytes")))
+        if p.get("commit_bytes") is not None:
+            lines.append("  ├ peak commit   %s   (Windows private bytes incl. pagefile; MemoryError depends on this)"
+                         % _fmt(p.get("commit_bytes")))
         lines.append("  └ baseline %s → final %s" % (_fmt(self.get("baseline_bytes")), _fmt(self.get("final_bytes"))))
         cg = self.get("cgroup")
         if cg:
@@ -436,7 +462,11 @@ class _Monitor:
         self.wall0 = time.time()
         self.baseline = self._sample_value()[0]
         self.peak = {"sampled_bytes": self.baseline, "sampled_at_s": 0.0, "phase_at_peak": None,
-                     "pss_bytes": None, "max_processes": 1, "hwm_by_pid": {}}
+                     "pss_bytes": None, "max_processes": 1, "hwm_by_pid": {}, "commit_by_pid": {}}
+        if self.baseline is None and not _LINUX and _psutil() is None:
+            msg = "cannot read process memory on %s without psutil: pip install psutil" % sys.platform
+            self.notes.append(msg)
+            print("[mempeak] WARNING: " + msg, file=sys.stderr)
         cg = self.cg.read()
         self.cg_before = cg
         self.cg_peak = cg["usage_bytes"] if cg else None
@@ -523,6 +553,11 @@ class _Monitor:
                     h = hwm_bytes(p)
                     if h is not None:
                         self.peak["hwm_by_pid"][p] = _max(self.peak["hwm_by_pid"].get(p), h)
+            if sys.platform == "win32":
+                for p in pids:
+                    c = commit_peak_bytes(p)
+                    if c is not None:
+                        self.peak["commit_by_pid"][p] = _max(self.peak["commit_by_pid"].get(p), c)
             if self.samples % self.stride == 0:
                 self.timeline.append([round(t, 3), value, cg_usage, label])
                 if len(self.timeline) >= _MAX_TIMELINE:
@@ -638,6 +673,7 @@ class _Monitor:
                     "phase_at_peak": self.peak["phase_at_peak"],
                     "pss_bytes": self.peak["pss_bytes"],
                     "python_heap_bytes": heap,
+                    "commit_bytes": _max(*self.peak["commit_by_pid"].values()) if self.peak["commit_by_pid"] else None,
                     "max_processes": self.peak["max_processes"]}
             cg = None
             after = self.cg.read()
@@ -816,7 +852,7 @@ def run_command(cmd, interval=0.02, out=None, flush_every=1.0, pss=False, label=
                                  % (_fmt(value), _fmt(kill_above)))
                 for p in reversed(_process_tree(proc.pid)):
                     with contextlib.suppress(OSError):
-                        os.kill(p, signal.SIGKILL)
+                        _kill(p)
         mon.on_sample = guard
     mon.start()
     forwarded = {}
@@ -854,7 +890,7 @@ def run_command(cmd, interval=0.02, out=None, flush_every=1.0, pss=False, label=
     oom_delta = None
     if mon.cg_before and cg_after.get("oom_kills") is not None and mon.cg_before.get("oom_kills") is not None:
         oom_delta = cg_after["oom_kills"] - mon.cg_before["oom_kills"]
-    likely_oom = sig == signal.SIGKILL and not killed["by_us"] and \
+    likely_oom = _SIGKILL is not None and sig == _SIGKILL and not killed["by_us"] and \
         (oom_delta is None or oom_delta > 0) and "sig" not in forwarded
     signame = None
     if sig:
@@ -865,10 +901,13 @@ def run_command(cmd, interval=0.02, out=None, flush_every=1.0, pss=False, label=
     if likely_oom and oom_delta is None:
         mon.notes.append("SIGKILL without readable cgroup oom_kill counter: OOM is likely but not confirmed "
                          "(check `dmesg | grep -i oom`)")
-    elif sig == signal.SIGKILL and oom_delta == 0 and not killed["by_us"]:
+    elif _SIGKILL is not None and sig == _SIGKILL and oom_delta == 0 and not killed["by_us"]:
         mon.notes.append("SIGKILL but the cgroup oom_kill counter did not change: a host-level OOM or an "
                          "external kill (check `dmesg | grep -i oom`)")
-    status = "killed" if sig else "exited"
+    if sys.platform == "win32" and code != 0 and not killed["by_us"]:
+        mon.notes.append("Windows has no OOM killer: running out of memory usually shows up as MemoryError "
+                         "(exit code 1) or a failed allocation in native code; see 'peak commit'")
+    status = "killed" if sig or killed["by_us"] else "exited"
     try:
         rep = mon.finish(status)
     finally:
@@ -893,7 +932,8 @@ def compare(before, after):
     row("PEAK", pa.get("peak_bytes"), pb.get("peak_bytes"))
     row("kernel HWM", pa.get("hwm_bytes"), pb.get("hwm_bytes"))
     row("sampled RSS", pa.get("sampled_bytes"), pb.get("sampled_bytes"))
-    for key, name in (("pss_bytes", "sampled PSS"), ("python_heap_bytes", "Python heap")):
+    for key, name in (("pss_bytes", "sampled PSS"), ("python_heap_bytes", "Python heap"),
+                      ("commit_bytes", "peak commit (Windows)")):
         if pa.get(key) is not None or pb.get(key) is not None:
             row(name, pa.get(key), pb.get(key))
     if a.get("cgroup") or b.get("cgroup"):
