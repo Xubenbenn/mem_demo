@@ -3,14 +3,35 @@
 给出目录和整改了的类名，全局扫描所有 `.py` 文件，找出 `__slots__` 化之后**不报错但行为/内存效果会变**的地方，以及会抛异常的地方。只依赖标准库，基于 AST（不是 grep），能识别 try/except 包裹、变量类型注解、继承链。
 
 ```bash
-python slots_audit.py src/ tests/ --classes Order,OrderItem
-python slots_audit.py src/ tests/ -c Order --related-only          # 隐藏与整改类无关文件中的泛化命中
-python slots_audit.py src/ -c Order --also .venv/lib/python3.11/site-packages/somelib   # 额外扫第三方库
-python slots_audit.py src/ -c Order --json audit.json
-python slots_audit.py src/ -c Order --python 3.9                   # 按目标 Python 版本判断（默认 = 运行脚本的解释器）
+python slots_audit.py src/ tests/ --classes Order,OrderItem            # 只看这些类受到的影响（默认）
+python slots_audit.py src/ tests/ -c Order --all                       # 另外列出对象类型无法确定的通用命中
+python slots_audit.py src/ tests/ -c Order --all --related-only        # 同上，但跳过从未提到整改类的文件
+python slots_audit.py src/ -c Order --also .venv/lib/python3.9/site-packages/somelib   # 额外扫第三方库
+python slots_audit.py src/ -c Order --python 3.9 --json audit.json     # 按目标版本判断；JSON 里 shown 字段标记是否显示
 ```
 
-退出码：有 SILENT 项时为 1，可直接放进 CI。默认跳过 `.git`、`.venv`、`venv`、`site-packages`、`build` 等目录，`--exclude 目录名` 追加。
+## 它做了什么
+
+1. **类定义检查**：`--classes` 里的类及其父类、子类（扫描范围内任意层级）是否真的 slots 化、写法在目标版本上是否成立。这部分天然只针对你列出的类。
+2. **用法检查**：找出对象上依赖 `__dict__` / 弱引用 / 动态属性的代码，并**推断对象的类型**。只有能推断出对象就是整改类（或其子类）的命中才算“影响”，按类分组输出；推断不出类型的命中只计数，`--all` 才列出。
+
+类型推断来源（都在扫描范围内按名字解析）：
+
+| 来源 | 例子 | 标记 |
+| --- | --- | --- |
+| 参数/变量注解 | `def f(o: Order)`、`o: Optional[Order] = ...` | confirmed |
+| 构造、拷贝 | `o = Order(...)`、`copy.copy(o)`、`replace(o, ...)` | confirmed |
+| 类方法里的 `self` | 整改类及子类的方法 | confirmed |
+| `isinstance` 收窄 | `if isinstance(x, Order):` 分支内、`assert isinstance(x, Order)` 之后 | confirmed |
+| 容器元素 | `orders: List[Order]` 后的 `for o in orders`、`enumerate`、`.values()`、`.items()`、推导式、`orders[0]` | confirmed |
+| 函数返回注解 | `def find() -> Optional[Order]` 后的 `o = find()`、`for o in all_orders()` | inferred |
+| 属性注解 | 某类里 `order: Order` / `self.order: Order` 后的 `x.order` | inferred |
+
+`inferred` 按函数名/属性名全项目匹配：同名函数或属性只要有一处注解不同，就不使用该推断。注解为**无关具体类型**（如 `c: Customer`、`s: str`）的对象，相关命中直接丢弃；注解为整改类的父类、`Any`、TypeVar 或扫描范围外的类型时仍算“类型不确定”。
+
+想让某处通用命中被归到正确的类下：给那个变量、参数或返回值加上类型注解即可。
+
+退出码：显示出来的结果里有 SILENT 时为 1，可直接放进 CI。默认跳过 `.git`、`.venv`、`venv`、`site-packages`、`build` 等目录，`--exclude 目录名` 追加。
 
 ## 分级
 
@@ -20,7 +41,7 @@ python slots_audit.py src/ -c Order --python 3.9                   # 按目标 P
 | **LOUD** | 执行到会抛异常；测试只有覆盖到那一行才能发现，清单可用来补测试 |
 | **INFO** | 人工确认：旧 pickle、扫描范围外的父类、弱引用容器 |
 
-可信度：`confirmed` = 能确定对象是整改类（参数/变量注解为该类、由该类构造、类自身方法里的 `self`）；`possible` = 通用模式命中、类型未知；`possible (file does not mention ...)` = 该文件从未提到整改类及其子类，多半无关。
+可信度：`confirmed` / `inferred` 见上表；`possible` = 通用模式命中、类型未知（默认不显示）；`possible (file does not mention ...)` = 该文件从未提到整改类及其子类，多半无关。
 
 ## 检查项
 
@@ -67,7 +88,7 @@ class Order:
 
 ## 局限
 
-- 静态分析，没有完整类型推断：不知道类型的对象只能按通用模式报 `possible`，会有误报；也会漏掉经过多层传递、容器、`**kwargs` 后的对象。SILENT 项建议逐条看，LOUD 项建议用测试兜底。
+- 静态分析，不是完整的类型检查器：没有注解、经过 `**kwargs`、`getattr` 动态取值、跨多层未注解函数传递的对象推断不出来，默认视图会漏掉它们——项目注解越完整，结果越准。不放心时用 `--all` 过一遍通用命中。
 - 按类名（不含模块）匹配；不同模块同名类会合并处理。
 - 第三方库只在 `--also` 指定时扫描，且只做用法检查。
 - 只看 `.py` 源码；C 扩展、`exec`/字符串拼出的属性名、Cython 不在范围内。

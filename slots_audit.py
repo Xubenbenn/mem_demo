@@ -114,6 +114,100 @@ def _annotation_targets(ann, targets):
     return set()
 
 
+_SEQ_TYPES = {"List", "list", "Sequence", "MutableSequence", "Iterable", "Iterator", "Collection", "Set", "set",
+              "FrozenSet", "frozenset", "AbstractSet", "MutableSet", "Deque", "deque", "Tuple", "tuple",
+              "Generator", "AsyncIterator", "AsyncIterable", "AsyncGenerator", "Reversible"}
+_MAP_TYPES = {"Dict", "dict", "Mapping", "MutableMapping", "DefaultDict", "defaultdict", "OrderedDict"}
+
+
+def _subscript_args(sub):
+    sl = sub.slice
+    if isinstance(sl, ast.Index):  # Python < 3.9
+        sl = sl.value
+    return list(sl.elts) if isinstance(sl, ast.Tuple) else [sl]
+
+
+def _element_target(ann, targets):
+    """T for containers of a target: List[T], Sequence[T], Dict[K, T], Optional[List[T]], 'List[T]'."""
+    if isinstance(ann, ast.Constant) and isinstance(ann.value, str):
+        try:
+            ann = ast.parse(ann.value, mode="eval").body
+        except SyntaxError:
+            return None
+    if isinstance(ann, ast.BinOp) and isinstance(ann.op, ast.BitOr):
+        found = {_element_target(ann.left, targets), _element_target(ann.right, targets)} - {None}
+        return found.pop() if len(found) == 1 else None
+    if not isinstance(ann, ast.Subscript):
+        return None
+    base, args = _last(_dotted(ann.value)), _subscript_args(ann)
+    if base in ("Optional", "Union"):
+        found = {_element_target(a, targets) for a in args} - {None}
+        return found.pop() if len(found) == 1 else None
+    if base in _MAP_TYPES and len(args) == 2:
+        elem = args[1]
+    elif base in _SEQ_TYPES and args:
+        elem = args[0]
+    else:
+        return None
+    t = _annotation_targets(elem, targets)
+    return next(iter(t)) if len(t) == 1 else None
+
+
+_OTHER = object()        # scope entry: known to be some class that is not a target
+_BUILTIN_TYPES = {"str", "int", "float", "bool", "bytes", "bytearray", "complex", "dict", "list", "set", "tuple",
+                  "frozenset", "Dict", "List", "Set", "Tuple", "FrozenSet", "Optional", "Union", "None",
+                  "Path", "datetime", "date", "Decimal", "UUID", "Callable", "Pattern", "Match"}
+
+
+class _T(str):
+    """A target class name that remembers how it was established (confirmed / inferred)."""
+    kind = "confirmed"
+
+
+def _tag(name, kind="confirmed"):
+    t = _T(name)
+    t.kind = getattr(name, "kind", "confirmed") if kind == "confirmed" else kind
+    return t
+
+
+def _type_maps(trees, names):
+    """Project-wide, name-based hints: functions returning a target and attributes annotated as one.
+
+    A name whose definitions disagree (any definition without the same target annotation) is dropped.
+    """
+    maps = {"returns": {}, "return_elems": {}, "attrs": {}, "attr_elems": {}}
+
+    def put(kind, key, value):
+        d = maps[kind]
+        d[key] = None if key in d and d[key] != value else value
+
+    def one(found):
+        return next(iter(found)) if len(found) == 1 else None
+
+    for tree, _extra in trees.values():
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                put("returns", node.name, one(_annotation_targets(node.returns, names)))
+                put("return_elems", node.name, _element_target(node.returns, names))
+            elif isinstance(node, ast.ClassDef):
+                for stmt in node.body:
+                    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                        put("attrs", stmt.target.id, one(_annotation_targets(stmt.annotation, names)))
+                        put("attr_elems", stmt.target.id, _element_target(stmt.annotation, names))
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Attribute):
+                put("attrs", node.target.attr, one(_annotation_targets(node.annotation, names)))
+                put("attr_elems", node.target.attr, _element_target(node.annotation, names))
+            elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Call) \
+                    and _last(_dotted(node.value.func)) in names:
+                for t in node.targets:
+                    if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) and t.value.id == "self":
+                        put("attrs", t.attr, _last(_dotted(node.value.func)))
+    for d in maps.values():
+        for k in [k for k, v in d.items() if v is None]:
+            del d[k]
+    return maps
+
+
 # --------------------------------------------------------------------------- class model
 class ClassInfo:
     def __init__(self, node, path):
@@ -252,22 +346,97 @@ class _UsageVisitor(ast.NodeVisitor):
             return ""
 
     def _add(self, severity, code, node, message, target=None, confirmed=False):
-        if not confirmed and not self.related and severity != INFO:
+        if confirmed:
+            confidence = getattr(target, "kind", "confirmed")
+        elif not self.related and severity != INFO:
             confidence = "possible (file does not mention the target classes)"
         else:
-            confidence = "confirmed" if confirmed else "possible"
-        self.findings.append(Finding(severity, code, self.path, node.lineno, message, self._snip(node),
-                                     confidence, target))
+            confidence = "possible"
+        root = self.subclass_root.get(str(target), str(target)) if target else None
+        f = Finding(severity, code, self.path, node.lineno, message, self._snip(node), confidence,
+                    root if confirmed else None)
+        if confirmed and root != str(target):
+            f["via"] = str(target)
+        self.findings.append(f)
+
+    def _lookup(self, name):
+        for scope in reversed(self.scopes):
+            if name in scope:
+                return scope[name]
+        return None
 
     def _target_of(self, expr):
-        """Target class name the expression is known to be an instance of, else None."""
+        """Target class the expression is known to be an instance of (a _T), else None."""
         if isinstance(expr, ast.Name):
-            for scope in reversed(self.scopes):
-                if expr.id in scope:
-                    return scope[expr.id]
-        if isinstance(expr, ast.Call) and _last(_dotted(expr.func)) in self.targets:
-            return _last(_dotted(expr.func))
+            v = self._lookup(expr.id)
+            return v if isinstance(v, str) else None
+        if isinstance(expr, ast.Call):
+            short = _last(_dotted(expr.func))
+            if short in self.names:
+                return _tag(short)
+            if short in ("copy", "deepcopy", "replace") and expr.args:   # copy.copy(o), dataclasses.replace(o)
+                return self._target_of(expr.args[0])
+            if short == "next" and expr.args:
+                return self._elems_of(expr.args[0])
+            r = self.maps["returns"].get(short)
+            return _tag(r, "inferred") if r else None
+        if isinstance(expr, ast.Attribute):
+            if self._is_class_expr(expr.value):
+                return None
+            a = self.maps["attrs"].get(expr.attr)
+            return _tag(a, "inferred") if a else None
+        if isinstance(expr, ast.Subscript) and not isinstance(_subscript_args(expr)[0], ast.Slice):
+            return self._elems_of(expr.value)
         return None
+
+    def _elems_of(self, expr):
+        """Target class of the elements of a container expression, else None."""
+        if isinstance(expr, ast.Name):
+            v = self._lookup(expr.id)
+            return v[1] if isinstance(v, tuple) and v[0] == "elems" else None
+        if isinstance(expr, ast.Call):
+            short = _last(_dotted(expr.func))
+            if isinstance(expr.func, ast.Attribute) and short in ("values", "copy") and not expr.args:
+                return self._elems_of(expr.func.value)
+            if isinstance(expr.func, ast.Name) and expr.args and \
+                    short in ("sorted", "list", "tuple", "set", "frozenset", "reversed", "iter", "filter"):
+                return self._elems_of(expr.args[-1])
+            r = self.maps["return_elems"].get(short)
+            return _tag(r, "inferred") if r else None
+        if isinstance(expr, ast.Attribute):
+            if self._is_class_expr(expr.value):
+                return None
+            a = self.maps["attr_elems"].get(expr.attr)
+            return _tag(a, "inferred") if a else None
+        if isinstance(expr, ast.Subscript) and isinstance(_subscript_args(expr)[0], ast.Slice):
+            return self._elems_of(expr.value)
+        if isinstance(expr, (ast.List, ast.Tuple, ast.Set)) and expr.elts:
+            found = {self._target_of(e) for e in expr.elts}
+            if len(found) == 1 and None not in found:
+                return found.pop()
+        return None
+
+    def _entry_from_annotation(self, ann):
+        t = _annotation_targets(ann, self.names)
+        if len(t) == 1:
+            return _tag(next(iter(t)))
+        e = _element_target(ann, self.names) if ann is not None else None
+        if e:
+            return ("elems", _tag(e))
+        return _OTHER if self._unrelated_annotation(ann) else None
+
+    def _unrelated_annotation(self, ann):
+        """True if the annotation names only concrete types that cannot hold a target instance."""
+        if ann is None or isinstance(ann, ast.Constant):
+            return False
+        names = {n.id for n in ast.walk(ann) if isinstance(n, ast.Name)} | \
+                {n.attr for n in ast.walk(ann) if isinstance(n, ast.Attribute)}
+        if not names or names & (self.names | self.target_ancestors):
+            return False
+        return all(n in _BUILTIN_TYPES or n in self.index.by_name for n in names)
+
+    def _is_other(self, expr):
+        return isinstance(expr, ast.Name) and self._lookup(expr.id) is _OTHER
 
     def _swallows(self, *exc_names):
         for caught in self.try_stack:
@@ -309,15 +478,13 @@ class _UsageVisitor(ast.NodeVisitor):
         scope = {}
         args = node.args
         all_args = list(getattr(args, "posonlyargs", [])) + args.args + args.kwonlyargs
-        for a in all_args:
-            t = _annotation_targets(a.annotation, self.targets)
-            if len(t) == 1:
-                scope[a.arg] = next(iter(t))
+        for a in all_args + [x for x in (args.vararg, args.kwarg) if x]:
+            scope[a.arg] = self._entry_from_annotation(a.annotation)
         if self.class_stack and all_args:
             owner = self.class_stack[-1]
             is_static = any(_last(_dotted(d)) in ("staticmethod", "classmethod") for d in node.decorator_list)
-            if not is_static and (owner in self.targets or owner in self.subclass_root):
-                scope[all_args[0].arg] = owner
+            if not is_static and owner in self.names:
+                scope[all_args[0].arg] = _tag(owner)
         self.scopes.append(scope)
         saved_try, self.try_stack = self.try_stack, []
         self.generic_visit(node)
@@ -329,16 +496,88 @@ class _UsageVisitor(ast.NodeVisitor):
     def visit_Lambda(self, node):
         self.generic_visit(node)
 
+    def _forget(self, target):
+        for n in ast.walk(target):
+            if isinstance(n, ast.Name):
+                self.scopes[-1][n.id] = None
+
     def _bind(self, target, value, annotation=None):
         if not isinstance(target, ast.Name):
+            self._forget(target) if isinstance(target, (ast.Tuple, ast.List, ast.Starred)) else None
             return
-        t = _annotation_targets(annotation, self.targets) if annotation is not None else set()
-        cls = next(iter(t)) if len(t) == 1 else self._target_of(value) if value is not None else None
-        scope = self.scopes[-1]
-        if cls:
-            scope[target.id] = cls
-        else:
-            scope.pop(target.id, None)
+        entry = self._entry_from_annotation(annotation) if annotation is not None else None
+        if entry is None and value is not None:
+            entry = self._target_of(value)
+            if entry is None:
+                e = self._elems_of(value)
+                entry = ("elems", e) if e else None
+        self.scopes[-1][target.id] = entry   # None shadows an outer binding
+
+    def _bind_loop(self, target, it):
+        if isinstance(target, ast.Name):
+            self.scopes[-1][target.id] = self._elems_of(it)
+            return
+        self._forget(target)
+        if isinstance(target, ast.Tuple) and len(target.elts) == 2 and isinstance(target.elts[1], ast.Name) \
+                and isinstance(it, ast.Call):
+            short = _last(_dotted(it.func))
+            if short == "enumerate" and it.args:
+                self.scopes[-1][target.elts[1].id] = self._elems_of(it.args[0])
+            elif short == "items" and isinstance(it.func, ast.Attribute):
+                self.scopes[-1][target.elts[1].id] = self._elems_of(it.func.value)
+
+    def visit_For(self, node):
+        self.visit(node.iter)
+        self._bind_loop(node.target, node.iter)
+        for stmt in node.body + node.orelse:
+            self.visit(stmt)
+
+    visit_AsyncFor = visit_For
+
+    def _visit_comp(self, node):
+        self.scopes.append({})
+        for gen in node.generators:
+            self.visit(gen.iter)
+            self._bind_loop(gen.target, gen.iter)
+            for cond in gen.ifs:
+                self.visit(cond)
+        for field in ("elt", "key", "value"):
+            if getattr(node, field, None) is not None:
+                self.visit(getattr(node, field))
+        self.scopes.pop()
+
+    visit_ListComp = visit_SetComp = visit_GeneratorExp = visit_DictComp = _visit_comp
+
+    def _narrowed(self, test):
+        """{name: target} implied by `isinstance(x, T)` (possibly and-ed)."""
+        out = {}
+        if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+            for v in test.values:
+                out.update(self._narrowed(v))
+        elif isinstance(test, ast.Call) and _dotted(test.func) == "isinstance" and len(test.args) == 2 \
+                and isinstance(test.args[0], ast.Name):
+            cls = test.args[1]
+            names = [_last(_dotted(e)) for e in cls.elts] if isinstance(cls, ast.Tuple) else [_last(_dotted(cls))]
+            hits = [n for n in names if n in self.names]
+            if len(hits) == 1 and len(names) == 1:
+                out[test.args[0].id] = _tag(hits[0])
+        return out
+
+    def visit_If(self, node):
+        self.visit(node.test)
+        narrowed = self._narrowed(node.test)
+        if narrowed:
+            self.scopes.append(narrowed)
+        for stmt in node.body:
+            self.visit(stmt)
+        if narrowed:
+            self.scopes.pop()
+        for stmt in node.orelse:
+            self.visit(stmt)
+
+    def visit_Assert(self, node):
+        self.generic_visit(node)
+        self.scopes[-1].update(self._narrowed(node.test))
 
     def visit_Assign(self, node):
         self.generic_visit(node)
@@ -396,12 +635,11 @@ class _UsageVisitor(ast.NodeVisitor):
 
     # -- patterns
     def _check_store(self, target, node):
-        if not isinstance(target, ast.Attribute):
+        if not isinstance(target, ast.Attribute) or self._is_other(target.value):
             return
         subject = target.value
         # T.field = ... at runtime replaces the slot descriptor for every instance
-        if isinstance(subject, ast.Name) and (subject.id in self.targets or subject.id in self.subclass_root) \
-                and not self.class_stack:
+        if isinstance(subject, ast.Name) and subject.id in self.names and not self.class_stack:
             root = subject.id if subject.id in self.targets else self.subclass_root[subject.id]
             if target.attr in self._target_fields(root):
                 self._add(SILENT, "A04", node, "给类属性 %s.%s 赋值会替换 slot 描述符：已存在实例读这个字段都静默拿到"
@@ -418,7 +656,8 @@ class _UsageVisitor(ast.NodeVisitor):
                       tgt, True)
 
     def visit_Attribute(self, node):
-        if node.attr == "__dict__" and isinstance(node.ctx, ast.Load) and not self._is_class_expr(node.value):
+        if node.attr == "__dict__" and isinstance(node.ctx, ast.Load) and not self._is_class_expr(node.value) \
+                and not self._is_other(node.value):
             tgt = self._target_of(node.value)
             if self._swallows("AttributeError"):
                 self._add(SILENT, "A01", node, "读取 obj.__dict__ 的异常被吞掉：slots 对象走异常分支，结果静默改变",
@@ -432,6 +671,9 @@ class _UsageVisitor(ast.NodeVisitor):
         name = _last(func)
         args = node.args
         subject = args[0] if args else None
+        if subject is not None and self._is_other(subject):
+            self.generic_visit(node)
+            return
         tgt = self._target_of(subject) if subject is not None else None
 
         if name == "getattr" and len(args) >= 2 and _const_str(args[1]) in ("__dict__", "__weakref__"):
@@ -639,51 +881,93 @@ def audit(paths, classes, also=(), exclude=_EXCLUDE_DIRS, python=None):
     classes_info = {t: index.by_name.get(t, []) for t in targets}
     for sub, root in subclass_root.items():
         classes_info.setdefault(sub, index.by_name.get(sub, []))
+    names = targets | set(subclass_root)
+    maps = _type_maps(trees, names)
+    ancestors = {a.name for t in targets for info in index.by_name.get(t, ()) for a in index.ancestors(info)}
     for rel, (tree, _is_extra) in trees.items():
         related = bool(mention and mention.search("\n".join(lines_of[rel])))
         v = _UsageVisitor(rel, lines_of[rel], targets, related, index, classes_info)
-        v.subclass_root = subclass_root
-        v.visit(tree)
+        v.subclass_root, v.names, v.maps = subclass_root, names, maps
+        v.target_ancestors = ancestors
+        try:
+            v.visit(tree)
+        except (RecursionError, ValueError, TypeError, AttributeError, IndexError, KeyError) as exc:
+            v.findings.append(Finding(INFO, "I09", rel, 0, "分析中断，该文件结果可能不完整：%s: %s"
+                                      % (type(exc).__name__, exc)))
         findings += v.findings
-    findings.sort(key=lambda f: (_ORDER[f["severity"]], f["confidence"] != "confirmed",
-                                 f["confidence"].startswith("possible ("), f["path"], f["line"]))
+    rank = {"confirmed": 0, "inferred": 1, "possible": 2}
+    findings.sort(key=lambda f: (_ORDER[f["severity"]], rank.get(f["confidence"], 3), f["path"], f["line"]))
     stats = {"files": len(trees), "own_files": len(own), "extra_files": len(extra),
-             "targets": sorted(targets), "subclasses": sorted(subclass_root), "python": "%d.%d" % py}
+             "targets": sorted(targets), "subclasses": sorted(subclass_root), "python": "%d.%d" % py,
+             "subclasses_of": {t: sorted(n for n, r in subclass_root.items() if r == t) for t in targets}}
     return findings, stats
 
 
-_TITLES = {SILENT: "SILENT —— 不报错，但行为或内存效果会改变（测试大概率发现不了）",
-           LOUD: "LOUD —— 运行到这里会抛异常（测试执行到这一行才能发现）",
-           INFO: "INFO —— 需要人工确认"}
+_TITLES = {SILENT: "SILENT 不报错，但行为或内存效果会改变",
+           LOUD: "LOUD   执行到会抛异常",
+           INFO: "INFO   需要人工确认"}
 
 
-def format_text(findings, stats, show_possible_unrelated=True):
-    out = ["slots_audit: Python %s；扫描 %d 个文件（其中额外目录 %d 个）；整改类：%s；子类：%s" % (
-        stats["python"], stats["files"], stats["extra_files"], ", ".join(stats["targets"]) or "-",
-        ", ".join(stats["subclasses"]) or "-")]
-    hidden = 0
-    for sev in (SILENT, LOUD, INFO):
-        items = [f for f in findings if f["severity"] == sev]
-        if not show_possible_unrelated:
-            kept = [f for f in items if not f["confidence"].startswith("possible (")]
-            hidden += len(items) - len(kept)
-            items = kept
-        if not items:
-            continue
+def is_specific(f):
+    """Finding that is tied to one of the converted classes (not a generic, type-unknown pattern)."""
+    return f.get("target") is not None and not f["confidence"].startswith("possible")
+
+
+def select(findings, show_all=False, related_only=False):
+    if not show_all:
+        return [f for f in findings if is_specific(f) or f["code"] == "I09"]
+    return [f for f in findings if not (related_only and f["confidence"].startswith("possible ("))]
+
+
+def _emit(out, f, indent="  "):
+    loc = "%s:%d" % (f["path"], f["line"]) if f["line"] else f["path"]
+    tags = [] if f["confidence"] == "confirmed" else [f["confidence"]]
+    if f.get("via"):
+        tags.append("经子类 %s" % f["via"])
+    out.append("%s[%s] %s%s" % (indent, f["code"], loc, "  (%s)" % "; ".join(tags) if tags else ""))
+    out.append("%s      %s" % (indent, f["message"]))
+    if f["snippet"]:
+        out.append("%s      | %s" % (indent, f["snippet"]))
+
+
+def format_text(findings, stats, show_all=False, related_only=False):
+    shown = select(findings, show_all, related_only)
+    out = ["slots_audit: Python %s；扫描 %d 个文件（额外目录 %d 个）" % (
+        stats["python"], stats["files"], stats["extra_files"])]
+    subs = stats.get("subclasses_of", {})
+    for target in stats["targets"]:
+        mine = [f for f in shown if f.get("target") == target]
         out.append("")
-        out.append("== %s  [%d]" % (_TITLES[sev], len(items)))
-        for f in items:
-            loc = "%s:%d" % (f["path"], f["line"]) if f["line"] else f["path"]
-            tag = "" if f["confidence"] == "confirmed" else "  (%s)" % f["confidence"]
-            out.append("[%s] %s%s" % (f["code"], loc, tag))
-            out.append("      %s" % f["message"])
-            if f["snippet"]:
-                out.append("      | %s" % f["snippet"])
-    counts = {s: sum(1 for f in findings if f["severity"] == s) for s in (SILENT, LOUD, INFO)}
+        out.append("### %s%s" % (target, "（子类：%s）" % ", ".join(subs[target]) if subs.get(target) else ""))
+        if not mine:
+            out.append("  未发现与该类相关的风险")
+        for sev in (SILENT, LOUD, INFO):
+            items = [f for f in mine if f["severity"] == sev]
+            if items:
+                out.append("  -- %s [%d]" % (_TITLES[sev], len(items)))
+                for f in items:
+                    _emit(out, f, "  ")
+    rest = [f for f in shown if f.get("target") not in stats["targets"]]
+    if rest:
+        out.append("")
+        out.append("### 类型无法确定的通用命中（可能涉及任何对象）" if show_all else "### 其他")
+        for sev in (SILENT, LOUD, INFO):
+            for f in (x for x in rest if x["severity"] == sev):
+                f2 = dict(f)
+                f2["code"] = "%s %s" % (sev, f["code"])
+                _emit(out, f2, "  ")
+    shown_ids = {id(f) for f in shown}
+    hidden = [f for f in findings if id(f) not in shown_ids]
     out.append("")
-    out.append("合计：SILENT %d，LOUD %d，INFO %d%s" % (counts[SILENT], counts[LOUD], counts[INFO],
-                                                     "（隐藏了 %d 条无关文件中的可能项，去掉 --related-only 可查看）" % hidden
-                                                     if hidden else ""))
+    counts = {sev: sum(1 for f in shown if f["severity"] == sev) for sev in (SILENT, LOUD, INFO)}
+    out.append("合计：SILENT %d，LOUD %d，INFO %d" % (counts[SILENT], counts[LOUD], counts[INFO]))
+    if hidden:
+        by_code = {}
+        for f in hidden:
+            by_code[f["code"]] = by_code.get(f["code"], 0) + 1
+        out.append("另有 %d 条通用命中未显示（对象类型无法确定，可能是任何类：%s）。加 --all 查看；"
+                   "确认是整改类的对象后，给变量/参数/返回值加类型注解即可被归到对应类下。"
+                   % (len(hidden), "，".join("%s×%d" % kv for kv in sorted(by_code.items()))))
     return "\n".join(out)
 
 
@@ -694,8 +978,10 @@ def main(argv=None):
     ap.add_argument("--also", action="append", default=[], metavar="DIR",
                     help="extra trees scanned for usages only, e.g. a third-party package (repeatable)")
     ap.add_argument("--exclude", action="append", default=[], metavar="DIRNAME", help="extra directory names to skip")
+    ap.add_argument("--all", action="store_true",
+                    help="also list generic findings whose object type is unknown (may involve any class)")
     ap.add_argument("--related-only", action="store_true",
-                    help="hide generic 'possible' findings in files that never mention the target classes")
+                    help="with --all: skip generic findings in files that never mention the target classes")
     ap.add_argument("--json", metavar="FILE", help="also write findings as JSON")
     ap.add_argument("--python", metavar="X.Y", help="Python version the code runs on (default: this interpreter)")
     args = ap.parse_args(argv)
@@ -705,11 +991,13 @@ def main(argv=None):
     except ValueError:
         ap.error("--python expects X.Y, e.g. 3.9")
     findings, stats = audit(args.paths, classes, args.also, _EXCLUDE_DIRS | set(args.exclude), python)
-    print(format_text(findings, stats, not args.related_only))
+    print(format_text(findings, stats, args.all, args.related_only))
+    shown = select(findings, args.all, args.related_only)
     if args.json:
-        with open(args.json, "w", encoding="utf-8") as f:
-            json.dump({"stats": stats, "findings": findings}, f, ensure_ascii=False, indent=1)
-    shown = [f for f in findings if not (args.related_only and f["confidence"].startswith("possible ("))]
+        for f in findings:
+            f["shown"] = any(f is g for g in shown)
+        with open(args.json, "w", encoding="utf-8") as fh:
+            json.dump({"stats": stats, "findings": findings}, fh, ensure_ascii=False, indent=1)
     return 1 if any(f["severity"] == SILENT for f in shown) else 0
 
 

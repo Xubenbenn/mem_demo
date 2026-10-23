@@ -110,5 +110,70 @@ class SlotsAuditTests(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
 
 
+
+SHOP = {"shop/models.py": 'from dataclasses import dataclass\nfrom typing import Dict, List, Optional\n\n\n@dataclass\nclass Order:                      # the only converted class\n    __slots__ = ("id", "items")\n    id: int\n    items: list\n\n\n@dataclass\nclass Customer:                   # untouched\n    name: str\n\n\n@dataclass\nclass Cart:\n    order: Order                  # attribute annotated -> cart.order is an Order\n    history: List[Order]\n    by_id: Dict[int, Order]\n    owner: Customer\n\n\ndef find_order(oid) -> Optional[Order]:\n    return None\n\n\ndef all_orders() -> List[Order]:\n    return []\n', "shop/service.py": 'import weakref\nfrom shop.models import Cart, Customer, all_orders, find_order\n\n_seen = weakref.WeakSet()\n\n\ndef dump(obj):                     # generic helper: type unknown\n    return getattr(obj, "__dict__", {})\n\n\ndef touch_customer(c: Customer):\n    try:\n        c.vip = True               # Customer is not converted: must NOT be reported\n    except AttributeError:\n        pass\n\n\ndef via_return(oid):\n    o = find_order(oid)            # return annotation\n    try:\n        o.cached = 1\n    except AttributeError:\n        pass\n\n\ndef via_loop():\n    for o in all_orders():         # List[Order] return\n        o.note = "x"\n    return [vars(x) for x in all_orders()]\n\n\ndef via_attr(cart: Cart):\n    weakref.ref(cart.order)        # attribute annotation\n    for i, o in enumerate(cart.history):\n        o.flag = 1\n    for k, o in cart.by_id.items():\n        hasattr(o, "__dict__")\n\n\ndef via_isinstance(x):\n    from shop.models import Order\n    if isinstance(x, Order):\n        return x.__dict__\n    return x.__dict__              # outside the branch: unknown\n'}
+
+
+class TypeInferenceTests(unittest.TestCase):
+    """Only the converted class's impacts are attributed to it; other classes stay out."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        for rel, src in SHOP.items():
+            path = os.path.join(cls.tmp.name, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(src)
+        cwd = os.getcwd()
+        os.chdir(cls.tmp.name)
+        try:
+            cls.findings, cls.stats = slots_audit.audit(["shop"], ["Order"], python=(3, 9))
+        finally:
+            os.chdir(cwd)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def specific_lines(self):
+        return {(f["code"], f["line"]) for f in slots_audit.select(self.findings)}
+
+    def line_of(self, needle):
+        for i, line in enumerate(SHOP["shop/service.py"].splitlines(), 1):
+            if needle in line:
+                return i
+        raise AssertionError(needle)
+
+    def test_each_inference_path_is_attributed_to_order(self):
+        got = self.specific_lines()
+        expected = {("A02", self.line_of("o.cached = 1")),             # return annotation
+                    ("L01", self.line_of('o.note = "x"')),             # List[Order] return + for loop
+                    ("L02", self.line_of("vars(x) for x")),            # comprehension
+                    ("L03", self.line_of("weakref.ref(cart.order)")),  # attribute annotation
+                    ("L01", self.line_of("o.flag = 1")),               # enumerate(List[Order] attribute)
+                    ("A01", self.line_of('hasattr(o, "__dict__")')),   # Dict[int, Order].items()
+                    ("L02", self.line_of("return x.__dict__"))}         # isinstance narrowing
+        self.assertEqual(expected - got, set())
+        for f in slots_audit.select(self.findings):
+            self.assertEqual(f["target"], "Order")
+
+    def test_unrelated_and_unknown_objects_are_not_attributed(self):
+        got = self.specific_lines()
+        self.assertNotIn(self.line_of("c.vip = True"), {line for _, line in got})
+        self.assertNotIn(self.line_of('getattr(obj, "__dict__", {})'), {line for _, line in got})
+        self.assertNotIn(self.line_of("outside the branch"), {line for _, line in got})
+        # annotated with an unrelated class: dropped entirely, even from --all
+        self.assertFalse([f for f in self.findings if f["line"] == self.line_of("c.vip = True")])
+        # unknown type: kept as a generic finding for --all
+        self.assertTrue([f for f in self.findings if f["line"] == self.line_of("outside the branch")])
+
+    def test_default_text_groups_by_class_and_counts_hidden(self):
+        text = slots_audit.format_text(self.findings, self.stats)
+        self.assertIn("### Order", text)
+        self.assertIn("--all", text)
+        self.assertNotIn("getattr(obj", text)
+        self.assertIn("getattr(obj", slots_audit.format_text(self.findings, self.stats, show_all=True))
+
 if __name__ == "__main__":
     unittest.main()
