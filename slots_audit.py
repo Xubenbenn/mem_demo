@@ -121,6 +121,7 @@ class ClassInfo:
         self.bases = [_dotted(b) for b in node.bases if _dotted(b)]
         self.explicit_slots = None      # set of names, or "unknown" when computed
         self.dataclass_slots = False
+        self.dataclass_weakref_kw = False
         self.slotted_decorator = None
         self.weakref = False
         self.fields = set()
@@ -135,6 +136,7 @@ class ClassInfo:
                 self.dataclass_slots = True
                 self.slotted_decorator = "dataclass(slots=True)"
                 self.weakref = bool(_kw(call, "weakref_slot"))
+                self.dataclass_weakref_kw = _kw(call, "weakref_slot") is not None
             elif name in ("s", "attrs") and _dotted(dec).startswith(("attr.", "attrs.")) and call is not None \
                     and _kw(call, "slots") is True:
                 self.slotted_decorator = "attr.s(slots=True)"
@@ -502,7 +504,7 @@ class _UsageVisitor(ast.NodeVisitor):
 
 
 # --------------------------------------------------------------------------- class checks
-def _class_findings(index, targets, lines_of):
+def _class_findings(index, targets, lines_of, py=sys.version_info[:2]):
     out = []
 
     def snip(info, line=None):
@@ -537,6 +539,15 @@ def _class_findings(index, targets, lines_of):
                 out.append(Finding(INFO, "I02", info.path, info.line,
                                    "父类 %s 不在扫描范围，无法确认是否 slots 化；运行时用 "
                                    "assert not hasattr(obj, '__dict__') 验证" % base, snip(info), target=name))
+            if info.dataclass_slots and py < (3, 10):
+                out.append(Finding(LOUD, "L07", info.path, info.line,
+                                   "Python %d.%d 的 dataclass 没有 slots 参数：类定义时抛 TypeError。3.9 可改为在类体里"
+                                   "手写 __slots__（字段不能带默认值），或用 attrs 的 @define" % py,
+                                   snip(info), target=name))
+            elif info.dataclass_weakref_kw and py < (3, 11):
+                out.append(Finding(LOUD, "L07", info.path, info.line,
+                                   "Python %d.%d 的 dataclass 没有 weakref_slot 参数（3.11+）：类定义时抛 TypeError；"
+                                   "改为手写 __slots__ 并包含 '__weakref__'" % py, snip(info), target=name))
             if info.dataclass_slots and info.explicit_slots is not None:
                 out.append(Finding(LOUD, "L04", info.path, info.line,
                                    "同时写了 __slots__ 和 dataclass(slots=True)：类定义时抛 TypeError",
@@ -545,26 +556,30 @@ def _class_findings(index, targets, lines_of):
                 for field, line in info.annotated_with_default.items():
                     if field in info.explicit_slots:
                         out.append(Finding(LOUD, "L04", info.path, line,
-                                           "手写 __slots__ 的字段 %r 带默认值：类定义时抛 ValueError（改用 "
-                                           "dataclass(slots=True)）" % field, snip(info, line), target=name))
+                                           "手写 __slots__ 的字段 %r 带默认值（含 field(...)）：类定义时抛 ValueError（%s）"
+                                           % (field, "去掉默认值，或改用 attrs 的 @define" if py < (3, 10)
+                                              else "改用 dataclass(slots=True)"), snip(info, line), target=name))
             no_dict = info.own_slotted
             for fn in info.cached_properties:
                 if no_dict:
                     out.append(Finding(LOUD, "L05", info.path, fn.lineno,
                                        "cached_property 需要实例 __dict__：首次访问抛 TypeError",
                                        snip(info, fn.lineno), target=name))
-            if info.dataclass_slots:
+            # dataclass(slots=True) re-creates the class; zero-arg super()/__class__ still see the
+            # old one. Measured: broken on 3.10-3.12 and 3.13.0, fixed by 3.13.16.
+            if info.dataclass_slots and (3, 10) <= py < (3, 14):
                 for fn in method_nodes(info):
                     for sub in ast.walk(fn):
                         if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id == "super" \
                                 and not sub.args:
                             out.append(Finding(LOUD, "L06", info.path, sub.lineno,
-                                               "dataclass(slots=True) 里无参 super()：Python 3.10–3.12 抛 TypeError"
-                                               "（实测 3.13.16 已修复），改成 super(%s, self)" % name, snip(info, sub.lineno), target=name))
+                                               "dataclass(slots=True) 里无参 super()：Python 3.10–3.12 及 3.13 早期补丁版本"
+                                               "（3.13.0 实测受影响，3.13.16 已修复）抛 TypeError，改成 super(%s, self)" % name, snip(info, sub.lineno), target=name))
                         elif isinstance(sub, ast.Name) and sub.id == "__class__":
                             out.append(Finding(SILENT, "A05", info.path, sub.lineno,
-                                               "dataclass(slots=True) 会重新创建类，Python 3.10–3.12 上方法里的 "
-                                               "__class__ 仍指向旧类：isinstance/is 比较静默得到 False（实测 3.13.16 已修复）", snip(info, sub.lineno),
+                                               "dataclass(slots=True) 会重新创建类，Python 3.10–3.12 及 3.13 早期补丁版本上"
+                                               "方法里的 __class__ 仍指向旧类：isinstance/is 比较静默得到 False"
+                                               "（3.13.0 实测受影响，3.13.16 已修复）", snip(info, sub.lineno),
                                                target=name))
     for info, root in index.descendants(targets):
         if info.name in targets:
@@ -596,7 +611,7 @@ def _parse(path):
     return src, ast.parse(src, filename=path)
 
 
-def audit(paths, classes, also=(), exclude=_EXCLUDE_DIRS):
+def audit(paths, classes, also=(), exclude=_EXCLUDE_DIRS, python=None):
     """Return (findings, stats). `also` = extra trees (e.g. third-party packages) scanned for usages only."""
     targets = set(classes)
     index, trees, lines_of, findings = _Index(), {}, {}, []
@@ -616,7 +631,8 @@ def audit(paths, classes, also=(), exclude=_EXCLUDE_DIRS):
             for node in ast.walk(tree):
                 if isinstance(node, ast.ClassDef):
                     index.add(ClassInfo(node, rel))
-    findings += _class_findings(index, targets, lines_of)
+    py = tuple(python or sys.version_info[:2])
+    findings += _class_findings(index, targets, lines_of, py)
     subclass_root = {info.name: root for info, root in index.descendants(targets) if info.name not in targets}
     mention = re.compile(r"\b(%s)\b" % "|".join(map(re.escape, sorted(targets | set(subclass_root))))) \
         if targets else None
@@ -632,7 +648,7 @@ def audit(paths, classes, also=(), exclude=_EXCLUDE_DIRS):
     findings.sort(key=lambda f: (_ORDER[f["severity"]], f["confidence"] != "confirmed",
                                  f["confidence"].startswith("possible ("), f["path"], f["line"]))
     stats = {"files": len(trees), "own_files": len(own), "extra_files": len(extra),
-             "targets": sorted(targets), "subclasses": sorted(subclass_root)}
+             "targets": sorted(targets), "subclasses": sorted(subclass_root), "python": "%d.%d" % py}
     return findings, stats
 
 
@@ -642,8 +658,8 @@ _TITLES = {SILENT: "SILENT —— 不报错，但行为或内存效果会改变�
 
 
 def format_text(findings, stats, show_possible_unrelated=True):
-    out = ["slots_audit: 扫描 %d 个文件（其中额外目录 %d 个）；整改类：%s；子类：%s" % (
-        stats["files"], stats["extra_files"], ", ".join(stats["targets"]) or "-",
+    out = ["slots_audit: Python %s；扫描 %d 个文件（其中额外目录 %d 个）；整改类：%s；子类：%s" % (
+        stats["python"], stats["files"], stats["extra_files"], ", ".join(stats["targets"]) or "-",
         ", ".join(stats["subclasses"]) or "-")]
     hidden = 0
     for sev in (SILENT, LOUD, INFO):
@@ -681,9 +697,14 @@ def main(argv=None):
     ap.add_argument("--related-only", action="store_true",
                     help="hide generic 'possible' findings in files that never mention the target classes")
     ap.add_argument("--json", metavar="FILE", help="also write findings as JSON")
+    ap.add_argument("--python", metavar="X.Y", help="Python version the code runs on (default: this interpreter)")
     args = ap.parse_args(argv)
     classes = [c.strip() for c in args.classes.split(",") if c.strip()]
-    findings, stats = audit(args.paths, classes, args.also, _EXCLUDE_DIRS | set(args.exclude))
+    try:
+        python = tuple(int(x) for x in args.python.split(".")[:2]) if args.python else None
+    except ValueError:
+        ap.error("--python expects X.Y, e.g. 3.9")
+    findings, stats = audit(args.paths, classes, args.also, _EXCLUDE_DIRS | set(args.exclude), python)
     print(format_text(findings, stats, not args.related_only))
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:

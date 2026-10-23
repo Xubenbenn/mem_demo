@@ -30,7 +30,8 @@ class SlotsAuditTests(unittest.TestCase):
         cwd = os.getcwd()
         os.chdir(cls.tmp.name)
         try:
-            cls.findings, cls.stats = slots_audit.audit(["app", "tests"], ["Order", "Item", "Manual"])
+            cls.findings, cls.stats = slots_audit.audit(["app", "tests"], ["Order", "Item", "Manual"],
+                                                          python=(3, 12))
         finally:
             os.chdir(cwd)
 
@@ -83,6 +84,20 @@ class SlotsAuditTests(unittest.TestCase):
         f = [f for f in self.findings if f["path"].replace(os.sep, "/") == "app/unrelated.py"]
         self.assertEqual(len(f), 1)
         self.assertTrue(f[0]["confidence"].startswith("possible ("))
+
+    def test_python39_target(self):
+        cwd = os.getcwd()
+        os.chdir(self.tmp.name)
+        try:
+            findings, stats = slots_audit.audit(["app"], ["Order"], python=(3, 9))
+        finally:
+            os.chdir(cwd)
+        codes = [f["code"] for f in findings]
+        self.assertEqual(stats["python"], "3.9")
+        self.assertIn("L07", codes)                      # dataclass(slots=True) does not exist on 3.9
+        self.assertNotIn("L06", codes)
+        self.assertNotIn("A05", codes)
+        self.assertNotIn("L07", [f["code"] for f in self.findings])   # the 3.12 run
 
     def test_cli_exit_code_and_missing_class(self):
         r = subprocess.run([sys.executable, os.path.join(ROOT, "slots_audit.py"), "app", "-c", "Nope",
