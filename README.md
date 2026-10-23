@@ -1,6 +1,7 @@
 # memwatch：检查点式运行时内存诊断
 
 > 想看**整段运行的内存峰值**、验证内存优化是否生效、排查 OOM？用 `python -m mempeak run -- <你的命令>`，见 [README_MEMPEAK.md](README_MEMPEAK.md)。
+> 用 `__slots__` 优化热点类？先跑 `python slots_audit.py src/ tests/ --classes 类名` 扫出静默风险，见 [README_SLOTS_AUDIT.md](README_SLOTS_AUDIT.md)。
 
 在指定业务节点观察：哪些变量可达大量对象、哪些类型占多少已识别内存、哪些 LocalProxy 共享目标，以及哪些分配点发生变化。
 
