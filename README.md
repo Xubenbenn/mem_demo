@@ -1,5 +1,7 @@
 # memwatch：检查点式运行时内存诊断
 
+> 想看**整段运行的内存峰值**、验证内存优化是否生效、排查 OOM？用 `python -m mempeak run -- <你的命令>`，见 [README_MEMPEAK.md](README_MEMPEAK.md)。
+
 在指定业务节点观察：哪些变量可达大量对象、哪些类型占多少已识别内存、哪些 LocalProxy 共享目标，以及哪些分配点发生变化。
 
 **v2.1 部署必须同时复制 `memwatch.py` 和 `_memwatch_core.py`，或使用整个仓库。** 运行核心无强制第三方依赖。`memprobe.py` 是旧 API 的兼容入口，复用同一统计引擎。
