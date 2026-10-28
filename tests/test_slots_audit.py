@@ -175,5 +175,59 @@ class TypeInferenceTests(unittest.TestCase):
         self.assertNotIn("getattr(obj", text)
         self.assertIn("getattr(obj", slots_audit.format_text(self.findings, self.stats, show_all=True))
 
+DECO = {"app/models.py": 'from dataclasses import dataclass, field\nfrom add_slots import add_slots\nfrom app.reg import register, slotify\n\n\nclass Registered:\n    def __init_subclass__(cls, **kw):\n        pass\n\n\n@add_slots\n@dataclass\nclass Order:\n    id: int\n    tags: list = field(default_factory=list)\n\n    def label(self):\n        return super().__repr__()\n\n    def same(self, o):\n        return isinstance(o, __class__)\n\n\n@dataclass\nclass VipOrder(Order):\n    level: int = 0\n\n\n@add_slots(weakref=True)\n@register\n@dataclass\nclass Item(Registered):\n    sku: str = ""\n\n\n@slotify\n@dataclass\nclass Custom:\n    a: int = 0\n', "app/service.py": 'import weakref\nfrom app.models import Item, Order\n\n\ndef tag(o: Order):\n    o.extra = 1\n\n\ndef keep(i: Item):\n    return weakref.ref(i)\n'}
+
+
+class AddSlotsDecoratorTests(unittest.TestCase):
+    """@add_slots (and --slots-decorator names) count as slotted and get the class re-creation rules."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        for rel, src in DECO.items():
+            path = os.path.join(cls.tmp.name, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(src)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def run_audit(self, classes, python, **kw):
+        cwd = os.getcwd()
+        os.chdir(self.tmp.name)
+        try:
+            return slots_audit.audit(["app"], classes, python=python, **kw)[0]
+        finally:
+            os.chdir(cwd)
+
+    def codes(self, findings, target):
+        return sorted(f["code"] for f in findings if f["target"] == target)
+
+    def line_of(self, needle):
+        for i, line in enumerate(DECO["app/models.py"].splitlines(), 1):
+            if needle in line:
+                return i
+        raise AssertionError(needle)
+
+    def test_add_slots_is_slotted_and_recreation_rules_apply_on_39(self):
+        findings = self.run_audit(["Order", "Item"], (3, 9))
+        self.assertEqual(self.codes(findings, "Order"), ["A05", "L01", "L06", "S03"])  # no S01
+        a06 = [f for f in findings if f["code"] == "A06"]
+        self.assertEqual([(f["target"], f["line"]) for f in a06], [("Item", self.line_of("@register"))])
+        self.assertEqual([f["target"] for f in findings if f["code"] == "A07"], ["Item"])
+        self.assertNotIn("L03", self.codes(findings, "Item"))          # add_slots(weakref=True)
+
+    def test_custom_decorator_name(self):
+        self.assertIn("S01", self.codes(self.run_audit(["Custom"], (3, 9)), "Custom"))
+        self.assertNotIn("S01", self.codes(self.run_audit(["Custom"], (3, 9), slots_decorators=["slotify"]),
+                                           "Custom"))
+        r = subprocess.run([sys.executable, os.path.join(ROOT, "slots_audit.py"), "app", "-c", "Custom",
+                            "--slots-decorator", "@slotify", "--python", "3.9"],
+                           cwd=self.tmp.name, capture_output=True, text=True)
+        self.assertNotIn("S01", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

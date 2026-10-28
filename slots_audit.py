@@ -38,6 +38,8 @@ _PICKLE_LOADS = {("pickle", "load"), ("pickle", "loads"), ("cPickle", "load"), (
 _WEAKREF_FUNCS = {"ref", "proxy", "finalize", "WeakMethod"}
 _WEAKREF_CONTAINERS = {"WeakValueDictionary", "WeakKeyDictionary", "WeakSet"}
 _ATTRS_SLOTTED_BY_DEFAULT = {"define", "frozen", "mutable"}
+# decorators that re-create a dataclass with __slots__ (add_slots.py); more via --slots-decorator
+SLOTS_DECORATORS = frozenset({"add_slots"})
 
 
 class Finding(dict):
@@ -210,25 +212,35 @@ def _type_maps(trees, names):
 
 # --------------------------------------------------------------------------- class model
 class ClassInfo:
-    def __init__(self, node, path):
+    def __init__(self, node, path, slots_decorators=SLOTS_DECORATORS):
         self.node, self.path, self.name, self.line = node, path, node.name, node.lineno
         self.bases = [_dotted(b) for b in node.bases if _dotted(b)]
         self.explicit_slots = None      # set of names, or "unknown" when computed
         self.dataclass_slots = False
         self.dataclass_weakref_kw = False
         self.slotted_decorator = None
+        self.recreated_by = None        # decorator that builds a new class object (slots=True, add_slots)
+        self.before_recreate = []       # (name, line) of decorators applied before that re-creation
         self.weakref = False
         self.fields = set()
         self.members = set()            # methods, properties, class attributes
         self.annotated_with_default = {}
         self.class_vars = set()
         self.cached_properties = []
-        for dec in node.decorator_list:
+        for i, dec in enumerate(node.decorator_list):
             name = _last(_dotted(dec))
             call = dec if isinstance(dec, ast.Call) else None
-            if name == "dataclass" and call is not None and _kw(call, "slots") is True:
+            if name in slots_decorators and not self.slotted_decorator:
+                self.slotted_decorator = self.recreated_by = "@" + name
+                self.weakref = call is not None and _kw(call, "weakref") is True
+                # decorators listed below run first, except @dataclass, which add_slots needs below it
+                self.before_recreate = [(_dotted(d), d.lineno) for d in node.decorator_list[i + 1:]
+                                        if _last(_dotted(d)) != "dataclass"]
+            elif name == "dataclass" and call is not None and _kw(call, "slots") is True:
                 self.dataclass_slots = True
                 self.slotted_decorator = "dataclass(slots=True)"
+                self.recreated_by = "@dataclass(slots=True)"
+                self.before_recreate = [(_dotted(d), d.lineno) for d in node.decorator_list[i + 1:]]
                 self.weakref = bool(_kw(call, "weakref_slot"))
                 self.dataclass_weakref_kw = _kw(call, "weakref_slot") is not None
             elif name in ("s", "attrs") and _dotted(dec).startswith(("attr.", "attrs.")) and call is not None \
@@ -769,7 +781,7 @@ def _class_findings(index, targets, lines_of, py=sys.version_info[:2]):
         for info in defs:
             if not info.own_slotted:
                 why = "__slots__ 里含 '__dict__'" if isinstance(info.explicit_slots, set) else \
-                    "既没有 __slots__ 也没有 dataclass(slots=True)"
+                    "既没有 __slots__ 也没有 dataclass(slots=True) 或 @add_slots；自定义装饰器名用 --slots-decorator 指定"
                 out.append(Finding(SILENT, "S01", info.path, info.line, "%s 实际没有 slots 化（%s），内存不会下降"
                                    % (name, why), snip(info), target=name))
             bad, unknown = index.chain_problems(info)
@@ -807,29 +819,43 @@ def _class_findings(index, targets, lines_of, py=sys.version_info[:2]):
                     out.append(Finding(LOUD, "L05", info.path, fn.lineno,
                                        "cached_property 需要实例 __dict__：首次访问抛 TypeError",
                                        snip(info, fn.lineno), target=name))
-            # dataclass(slots=True) re-creates the class; zero-arg super()/__class__ still see the
-            # old one. Measured: broken on 3.10-3.12 and 3.13.0, fixed by 3.13.16.
-            if info.dataclass_slots and (3, 10) <= py < (3, 14):
+            # Re-creating the class leaves zero-arg super()/__class__ bound to the old one. dataclass(slots=True):
+            # measured broken on 3.10-3.12 and 3.13.0, fixed by 3.13.16. A custom decorator: broken everywhere.
+            custom = info.recreated_by is not None and not info.dataclass_slots
+            if custom or info.dataclass_slots and (3, 10) <= py < (3, 14):
+                when = "所有 Python 版本上" if custom else "Python 3.10–3.12 及 3.13 早期补丁版本上（3.13.0 实测受影响，3.13.16 已修复）"
                 for fn in method_nodes(info):
                     for sub in ast.walk(fn):
                         if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id == "super" \
                                 and not sub.args:
                             out.append(Finding(LOUD, "L06", info.path, sub.lineno,
-                                               "dataclass(slots=True) 里无参 super()：Python 3.10–3.12 及 3.13 早期补丁版本"
-                                               "（3.13.0 实测受影响，3.13.16 已修复）抛 TypeError，改成 super(%s, self)" % name, snip(info, sub.lineno), target=name))
+                                               "%s 会重新创建类，方法里无参 super()：%s抛 TypeError，改成 super(%s, self)"
+                                               % (info.recreated_by, when, name), snip(info, sub.lineno), target=name))
                         elif isinstance(sub, ast.Name) and sub.id == "__class__":
                             out.append(Finding(SILENT, "A05", info.path, sub.lineno,
-                                               "dataclass(slots=True) 会重新创建类，Python 3.10–3.12 及 3.13 早期补丁版本上"
-                                               "方法里的 __class__ 仍指向旧类：isinstance/is 比较静默得到 False"
-                                               "（3.13.0 实测受影响，3.13.16 已修复）", snip(info, sub.lineno),
-                                               target=name))
+                                               "%s 会重新创建类，方法里的 __class__ 仍指向被丢弃的旧类：%s，"
+                                               "isinstance/is 比较静默得到 False，改用 type(self) 或类名"
+                                               % (info.recreated_by, when), snip(info, sub.lineno), target=name))
+            for dec, line in info.before_recreate:
+                out.append(Finding(SILENT, "A06", info.path, line,
+                                   "装饰器 @%s 写在 %s 下面，先于它执行：拿到的是被丢弃的旧类（注册表/缓存里存的类"
+                                   "与最终的 %s 不是同一个，用它创建的实例仍带 __dict__）。把它移到 %s 上面"
+                                   % (dec, info.recreated_by, name, info.recreated_by), snip(info, line), target=name))
+            if info.recreated_by:
+                for anc in index.ancestors(info):
+                    if "__init_subclass__" in anc.members:
+                        out.append(Finding(SILENT, "A07", info.path, info.line,
+                                           "父类 %s（%s:%d）定义了 __init_subclass__：%s 重新创建类时它会执行两次，"
+                                           "第一次传入的是被丢弃的旧类（注册表里会多出一个旧类）"
+                                           % (anc.name, anc.path, anc.line, info.recreated_by), snip(info),
+                                           target=name))
     for info, root in index.descendants(targets):
         if info.name in targets:
             continue
         if not info.own_slotted:
             out.append(Finding(SILENT, "S03", info.path, info.line,
                                "子类 %s 没有 slots 化：它的实例仍带 __dict__，内存不会下降，也不会报错"
-                               "（dataclass 子类同样要写 slots=True）" % info.name,
+                               "（dataclass 子类同样要写 slots=True 或加 @add_slots）" % info.name,
                                lines_of.get(info.path, [""] * info.line)[info.line - 1].strip(), target=root))
     return out
 
@@ -853,8 +879,10 @@ def _parse(path):
     return src, ast.parse(src, filename=path)
 
 
-def audit(paths, classes, also=(), exclude=_EXCLUDE_DIRS, python=None):
-    """Return (findings, stats). `also` = extra trees (e.g. third-party packages) scanned for usages only."""
+def audit(paths, classes, also=(), exclude=_EXCLUDE_DIRS, python=None, slots_decorators=()):
+    """Return (findings, stats). `also` = extra trees (e.g. third-party packages) scanned for usages only.
+    `slots_decorators` = extra names of decorators that add __slots__ like add_slots does."""
+    decorators = SLOTS_DECORATORS | set(slots_decorators)
     targets = set(classes)
     index, trees, lines_of, findings = _Index(), {}, {}, []
     own = list(_iter_py(paths, exclude))
@@ -872,7 +900,7 @@ def audit(paths, classes, also=(), exclude=_EXCLUDE_DIRS, python=None):
         if path not in extra:
             for node in ast.walk(tree):
                 if isinstance(node, ast.ClassDef):
-                    index.add(ClassInfo(node, rel))
+                    index.add(ClassInfo(node, rel, decorators))
     py = tuple(python or sys.version_info[:2])
     findings += _class_findings(index, targets, lines_of, py)
     subclass_root = {info.name: root for info, root in index.descendants(targets) if info.name not in targets}
@@ -984,13 +1012,16 @@ def main(argv=None):
                     help="with --all: skip generic findings in files that never mention the target classes")
     ap.add_argument("--json", metavar="FILE", help="also write findings as JSON")
     ap.add_argument("--python", metavar="X.Y", help="Python version the code runs on (default: this interpreter)")
+    ap.add_argument("--slots-decorator", action="append", default=[], metavar="NAME",
+                    help="name of your own decorator that adds __slots__ like add_slots (repeatable, or a,b)")
     args = ap.parse_args(argv)
     classes = [c.strip() for c in args.classes.split(",") if c.strip()]
     try:
         python = tuple(int(x) for x in args.python.split(".")[:2]) if args.python else None
     except ValueError:
         ap.error("--python expects X.Y, e.g. 3.9")
-    findings, stats = audit(args.paths, classes, args.also, _EXCLUDE_DIRS | set(args.exclude), python)
+    decorators = [d.strip().lstrip("@") for v in args.slots_decorator for d in v.split(",") if d.strip()]
+    findings, stats = audit(args.paths, classes, args.also, _EXCLUDE_DIRS | set(args.exclude), python, decorators)
     print(format_text(findings, stats, args.all, args.related_only))
     shown = select(findings, args.all, args.related_only)
     if args.json:

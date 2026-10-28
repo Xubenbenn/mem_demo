@@ -8,6 +8,7 @@ python slots_audit.py src/ tests/ -c Order --all                       # 另外�
 python slots_audit.py src/ tests/ -c Order --all --related-only        # 同上，但跳过从未提到整改类的文件
 python slots_audit.py src/ -c Order --also .venv/lib/python3.9/site-packages/somelib   # 额外扫第三方库
 python slots_audit.py src/ -c Order --python 3.9 --json audit.json     # 按目标版本判断；JSON 里 shown 字段标记是否显示
+python slots_audit.py src/ -c Order --slots-decorator my_slots          # 你自己的、作用同 add_slots 的装饰器
 ```
 
 ## 它做了什么
@@ -54,20 +55,23 @@ python slots_audit.py src/ -c Order --python 3.9 --json audit.json     # 按目�
 | A02 | SILENT | 在 `except AttributeError` / `except Exception` / 裸 except / `suppress(...)` 里的属性赋值或 `setattr`——赋值被静默吞掉 |
 | A03 | SILENT | 弱引用失败被吞掉 → 常见是改存强引用，**对象释放不掉** |
 | A04 | SILENT | `Cls.field = ...`、`mock.patch.object(Cls, "field")`、`patch("m.Cls.field")`、`setattr(Cls, "field", ...)`：替换 slot 描述符，已存在实例读到类上的值 |
-| A05 | SILENT | `dataclass(slots=True)` 方法里使用 `__class__`：3.10–3.12 及 3.13 早期补丁版本上指向旧类，`isinstance` 静默为 False |
+| A05 | SILENT | 重建类的方法里使用 `__class__`，指向旧类，`isinstance` 静默为 False：`dataclass(slots=True)` 在 3.10–3.12 及 3.13 早期补丁版本上；`@add_slots` 在所有版本上 |
+| A06 | SILENT | 写在 `@add_slots` / `@dataclass(slots=True)` **下面**的其他装饰器（如注册器）先执行，拿到的是被丢弃的旧类 |
+| A07 | SILENT | 父类定义了 `__init_subclass__`：重建类时执行两次，第一次传入旧类 |
 | L01 | LOUD | 给整改类实例设置未声明的属性 |
 | L02 | LOUD | `o.__dict__` / `vars(o)` / `getattr(o, "__dict__")` |
 | L03 | LOUD | `weakref.ref/proxy/finalize`，而类没有 `__weakref__` 槽（dataclass 用 `weakref_slot=True`） |
 | L04 | LOUD | `__slots__` 与 `dataclass(slots=True)` 重复；手写 `__slots__` 的字段带默认值 |
 | L05 | LOUD | `functools.cached_property`（需要 `__dict__`） |
-| L06 | LOUD | `dataclass(slots=True)` 里无参 `super()`：3.10–3.12 及 3.13 早期补丁版本抛 TypeError |
+| L06 | LOUD | 重建类里无参 `super()` 抛 TypeError：`dataclass(slots=True)` 在 3.10–3.12 及 3.13 早期补丁版本上；`@add_slots` 在所有版本上 |
 | L07 | LOUD | 目标版本不支持：`dataclass(slots=True)` 需要 3.10+，`weakref_slot=True` 需要 3.11+ |
 | I00 | INFO | 没找到类定义（拼写，或不在扫描目录） |
 | I01 | INFO | `pickle/joblib/dill/torch.load` 等：整改前保存的 pickle 加载会失败 |
 | I02 | INFO | 父类在扫描范围外，无法确认 |
 | I03 | INFO | `WeakValueDictionary/WeakKeyDictionary/WeakSet`：放入的对象必须支持弱引用 |
 
-支持的类定义形式：手写 `__slots__`、`@dataclass(slots=True)`（含 `weakref_slot`）、`attrs` 的 `@define/@frozen/@mutable` 与 `@attr.s(slots=True)`。
+支持的类定义形式：手写 `__slots__`、`@dataclass(slots=True)`（含 `weakref_slot`）、`@add_slots`（含 `weakref=True`；
+自定义名字用 `--slots-decorator`）、`attrs` 的 `@define/@frozen/@mutable` 与 `@attr.s(slots=True)`。
 
 ## Python 3.9
 
@@ -82,7 +86,24 @@ class Order:
     tags: list                           # 字段不能有默认值 / field(...)，否则类定义时 ValueError（L04）
 ```
 
-需要默认值时用 `attrs` 的 `@define`（默认 slots，支持默认值，可用于 3.9）。手写 `__slots__` 不会重建类，所以 L06/A05 不适用；其余检查项（继承链、`__dict__`、弱引用、patch 等）在 3.9 上同样成立。
+需要默认值时有两种选择：
+
+- 仓库里的 `add_slots.py`：在 `@dataclass` 之后重建一个带 `__slots__` 的类，相当于 3.10+ 的 `slots=True`。
+  默认值、`default_factory`、`__post_init__`、`frozen`、`is_dataclass/fields/asdict/replace` 都照常；
+  frozen 类的 copy/pickle、整改前保存的 pickle 都能正常加载。
+  因为重建了类，L06/A05/A06/A07 在**所有版本**上都适用。
+
+  ```python
+  @add_slots                 # 必须写在 @dataclass 上面；其他装饰器也写在它上面
+  @dataclass
+  class Order:
+      id: int
+      tags: list = field(default_factory=list)
+  ```
+
+- `attrs` 的 `@define`（默认 slots，支持默认值，可用于 3.9）。
+
+手写 `__slots__` 不会重建类，所以 L06/A05/A06/A07 不适用；其余检查项（继承链、`__dict__`、弱引用、patch 等）在 3.9 上同样成立。
 
 版本实测：`super()` / `__class__` 问题在 3.10.20、3.11、3.12、3.13.0 上复现，3.13.16 已修复。
 
