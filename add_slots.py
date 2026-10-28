@@ -19,7 +19,8 @@ The class is re-created, so inside its methods zero-arg super() raises TypeError
 names the discarded class, on every Python version; decorators applied before it and
 __init_subclass__ hooks also see that discarded class. Run slots_audit to find those.
 """
-from dataclasses import fields, is_dataclass
+import functools
+from dataclasses import MISSING, fields, is_dataclass
 
 __all__ = ["add_slots"]
 
@@ -38,6 +39,15 @@ def _setstate(self, state):
         state = merged
     for name, value in state.items():
         object.__setattr__(self, name, value)
+
+
+def _with_defaults(init, defaults):
+    @functools.wraps(init)
+    def __init__(self, *args, **kwargs):
+        for name, value in defaults:
+            object.__setattr__(self, name, value)
+        init(self, *args, **kwargs)
+    return __init__
 
 
 def add_slots(cls=None, *, weakref=False):
@@ -59,6 +69,11 @@ def add_slots(cls=None, *, weakref=False):
         d.pop("__dict__", None)
         d.pop("__weakref__", None)
         d.setdefault("__setstate__", _setstate)
+        # The generated __init__ skips field(default=..., init=False) and relies on the class
+        # attribute removed above (dataclass(slots=True) sets them itself), so set them before it runs.
+        no_init = [(f.name, f.default) for f in fields(cls) if not f.init and f.default is not MISSING]
+        if no_init and "__init__" in d:
+            d["__init__"] = _with_defaults(d["__init__"], no_init)
         return type(cls)(cls.__name__, cls.__bases__, d)
 
     return wrap if cls is None else wrap(cls)

@@ -1,5 +1,6 @@
 """Tests for add_slots (dataclass __slots__ on Python 3.9)."""
 import copy
+import inspect
 import dataclasses
 import pickle
 import unittest
@@ -43,6 +44,17 @@ class Ref:
 @dataclass
 class Child(Item):
     level: int = 0
+
+
+@add_slots
+@dataclass
+class Totals:
+    id: int
+    total: int = field(default=0, init=False)
+    seen: list = field(default_factory=list, init=False)
+
+    def __post_init__(self):
+        self.total += 1
 
 
 @add_slots
@@ -94,6 +106,12 @@ class AddSlotsTests(unittest.TestCase):
         c = Child("A", level=2)
         self.assertFalse(hasattr(c, "__dict__"))
         self.assertEqual(pickle.loads(pickle.dumps(c)), c)
+
+    def test_init_false_fields_with_defaults_are_set(self):
+        t = Totals(1)
+        self.assertEqual((t.total, t.seen), (1, []))            # default set before __post_init__
+        self.assertEqual(repr(t), "Totals(id=1, total=1, seen=[])")
+        self.assertEqual(str(inspect.signature(Totals)), "(id: int) -> None")
 
     def test_misuse_is_rejected(self):
         with self.assertRaises(TypeError):
